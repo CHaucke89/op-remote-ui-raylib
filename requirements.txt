@@ -1,8 +1,10 @@
-# OpenPilot UI Streaming Server Dependencies (host running stream_server.py)
-Flask==2.3.3
-flask-sock==0.7.0
-numpy==1.24.3
+# Installed by install.sh into ./vendor using openpilot's Python, so the UI
+# process and the stream server share one ABI-matched set of packages.
+# (openpilot provides none of these.)
 
-# UI-side capture dependencies (openpilot device, alongside pyray).
-# pyray is already provided by openpilot; Pillow replaces Qt's JPEG encoder.
+# Stream server
+Flask>=2.3
+flask-sock>=0.7
+
+# UI-side JPEG encoding (replaces Qt's encoder)
 Pillow>=10.0.0

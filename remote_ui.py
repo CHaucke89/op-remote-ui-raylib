@@ -1,5 +1,15 @@
-from openpilot.selfdrive.ui.frame_streamer import FrameStreamer
-from openpilot.selfdrive.ui.touch_injector import TouchInjector
+import os
+import sys
+
+# Flat imports: this directory (and its ./vendor deps) is put on sys.path
+# by remote_ui_auto.py, or implicitly when running this file directly.
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (_here, os.path.join(_here, "vendor")):
+  if os.path.isdir(_p) and _p not in sys.path:
+    sys.path.insert(0, _p)
+
+from frame_streamer import FrameStreamer  # noqa: E402
+from touch_injector import TouchInjector  # noqa: E402
 
 
 class RemoteUI:

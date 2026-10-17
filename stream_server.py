@@ -4,6 +4,7 @@ OpenPilot UI Streaming Server - Real-time WebSocket streaming
 """
 
 import os
+import sys
 import time
 import json
 import socket
@@ -14,6 +15,11 @@ import threading
 import base64
 import queue
 from collections import deque
+
+# install.sh installs dependencies into ./vendor next to this file.
+_vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if os.path.isdir(_vendor):
+  sys.path.insert(0, _vendor)
 
 from flask import Flask, render_template_string, request, jsonify, Response
 from flask_sock import Sock
@@ -818,3 +824,7 @@ def main() -> None:
     app.run(host='0.0.0.0', port=8081, debug=False)
   finally:
     shm_reader.close()
+
+
+if __name__ == "__main__":
+  main()

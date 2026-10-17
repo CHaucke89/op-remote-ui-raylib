@@ -83,77 +83,41 @@ struct SharedFrame {
 
 ## Installation
 
-Install Python dependencies for the server and frame encoding:
+On the device (or any machine with an openpilot checkout):
 
 ```bash
-pip3 install -r requirements.txt
+curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui/main/install.sh | bash
 ```
 
-`requirements.txt` includes:
+Or from a clone: `./install.sh [OPENPILOT_DIR]` (default `/data/openpilot`).
 
-- Flask
-- flask-sock
-- numpy
-- Pillow
+The installer:
 
-## Integrating into openpilot UI (raylib/pyray)
+1. Copies the files to `/data/op-remote-ui` (override with `INSTALL_DIR`).
+2. Installs Flask, flask-sock and Pillow into `/data/op-remote-ui/vendor` using openpilot's Python (`.venv` if present), so openpilot's own environment is untouched.
+3. Adds one marked line to `selfdrive/ui/ui.py` that imports `remote_ui_auto`. It is safe to re-run.
 
-Copy `remote_ui.py`, `touch_injector.py`, and `frame_streamer.py` to `/openpilot/selfdrive/ui/`.
-Copy `stream_server.py` to `/data/`.
+Restart the UI (or reboot) and open `http://DEVICE_IP:8081`.
 
-Edit your UI entrypoint (typically `selfdrive/ui/ui.py`) and wire `RemoteUI` into the render loop.
-Imort `RemoteUI` and create a `remote` object:
+`remote_ui_auto` wraps `pyray.end_drawing` to capture each frame before the buffer swap, starts `RemoteUI` once the window exists, and launches `stream_server.py` itself. No render-loop edits or launch-script changes are needed. Set `OP_REMOTE_UI=0` to disable it without uninstalling.
+
+To remove: `./uninstall.sh [OPENPILOT_DIR]`. openpilot updates may reset `ui.py`; just re-run `install.sh`.
+
+### Manual integration
+
+If you prefer to wire it in yourself, put this directory on `sys.path` and call `RemoteUI` from your render loop:
 
 ```python
-from openpilot.selfdrive.ui.remote_ui import RemoteUI
+from remote_ui import RemoteUI
 
-def main():
-        gui_app.init_window("UI")
-        remote = RemoteUI()
+remote = RemoteUI()          # after the window/GL context exists
+...
+remote.stream_frame()        # each frame, before end_drawing
+...
+remote.close()
 ```
 
-Stream the frame after `should_render`:
-
-```python
-if should_render:
-    remote.stream_frame()
-```
-
-Close the connection - add to the very end of `main()`:
-
-```python
-    remote.close()
-
-if __name__ == "__main__":
-  main()
-```
-
-Important:
-
-- Construct `RemoteUI()` only after the window/context exists.
-- Call `remote.stream_frame()` while the current frame is still available (before buffer swap).
-
-## Running the Streaming Server
-
-Start server:
-
-```bash
-python3 stream_server.py
-```
-
-Optionally, have the server start automatically on boot. Add to `launch_openpilot.sh` after the shebang:
-
-```bash
-#!/usr/bin/env bash
-
-python3 /data/stream_server.py &
-```
-
-Open in browser:
-
-```text
-http://DEVICE_IP:8081
-```
+Then run `python3 stream_server.py` yourself.
 
 ## Endpoints
 
@@ -185,8 +149,7 @@ Examples:
 
 `remote_ui.py` includes a standalone test window in its `__main__` block.
 
-Important: this file imports modules via the openpilot package path (`openpilot.selfdrive.ui...`).
-Run this smoke test from an environment where these files are placed in that package structure (for example inside your openpilot checkout), not from this flat repository layout as-is.
+Run it directly from this directory (`python3 remote_ui.py`); imports are flat, so no openpilot package layout is required.
 
 ## Troubleshooting
 
