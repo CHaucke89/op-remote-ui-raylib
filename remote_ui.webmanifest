@@ -1,0 +1,11 @@
+{
+  "name": "openpilot Remote UI",
+  "short_name": "Remote UI",
+  "description": "Remote UI stream for openpilot",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#000000",
+  "theme_color": "#000000"
+}

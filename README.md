@@ -21,36 +21,45 @@ The C++/Qt files are still in this repository as a legacy implementation referen
 
 This project moves openpilot UI frames from the render loop to a browser with no disk writes:
 
-1. UI process captures the current framebuffer and JPEG-encodes it.
-2. Encoded frame is written into POSIX shared memory at `/dev/shm/openpilot_ui_frames`.
-3. `stream_server.py` reads shared memory and broadcasts frames over WebSocket.
-4. Browser displays frames on a `<canvas>` and sends touch/mouse/scroll input to `/input`.
+1. Once a browser connects, the UI process grabs the framebuffer each frame (only the GPU readback runs on the render thread) and a worker thread JPEG-encodes it.
+2. The encoded frame is written into POSIX shared memory at `/dev/shm/openpilot_ui_frames`.
+3. `stream_server.py` reads shared memory and broadcasts frames over one WebSocket per browser.
+4. The browser draws frames on a `<canvas>` and sends touch, mouse, scroll and keyboard input back over the same WebSocket (`POST /input` is a fallback).
 5. Input is forwarded to `/tmp/ui_touch_socket`, where `touch_injector.py` applies it to pyray input hooks.
+6. The server publishes its client count, the browsers' network delay and their requested frame width in `/dev/shm/openpilot_ui_clients`, which the UI uses to adapt.
+
+The browser page can be installed as a PWA ("Add to Home Screen"), which runs it full screen in landscape.
 
 ## Current Components
 
 ### Python (active)
 
 - `frame_streamer.py`
-    - Captures with `pyray.load_image_from_screen()`.
-    - JPEG encodes with Pillow.
+    - Captures with `pyray.load_image_from_screen()` and hands the image to an encoder thread, so encoding doesn't add to UI frame time. Frames are skipped, not queued, while the encoder is busy.
+    - Skips re-encoding when the screen hasn't changed, re-announcing the previous frame once a second so the stream doesn't look stalled.
+    - Adapts JPEG quality (55 to 90) and frame rate (4 to 10 FPS) to encode time, frame size and network delay; drops to 1 FPS with no browser connected.
+    - Encodes at half resolution when every connected browser is small enough not to need full size.
     - Publishes to shared memory using a packed 31-byte header + payload.
-    - Frame rate limited to 10 FPS by `FRAME_RATE_LIMIT`.
 
 - `touch_injector.py`
-    - Listens on Unix socket `/tmp/ui_touch_socket`.
-    - Accepts JSON input events (`click`, `tap`, `drag`, `scroll`, `touchstart`, etc.).
-    - Monkeypatches pyray polled input functions to expose remote state.
+    - Listens on Unix socket `/tmp/ui_touch_socket` for newline-delimited JSON input events.
+    - Monkeypatches pyray polled input functions (mouse, touch, wheel and keyboard) to expose remote state, falling back to local input.
+    - Keyboard events and pasted text are queued and released one frame at a time.
+
+- `client_state.py`
+    - Tiny shared memory segment the server writes and the UI maps read-only: client count, worst network delay and requested frame width.
 
 - `remote_ui.py`
-    - Convenience wrapper that starts `TouchInjector` and `FrameStreamer`.
-    - Intended to be instantiated after window/GL context initialization.
+    - Starts `TouchInjector` and `FrameStreamer`. Remote input is ignored while openpilot is engaged (local touch keeps working).
+
+- `remote_ui_auto.py`
+    - Zero-integration hook (see Installation). Starts the server, creates `RemoteUI` when the first browser connects and streams only while one is connected.
 
 - `stream_server.py`
     - Flask + flask-sock server on port `8081`.
-    - Reads shared memory via `mmap`.
-    - Broadcasts latest frames to connected WebSocket clients.
-    - Serves a built-in HTML page with remote controls.
+    - Reads shared memory via `mmap` and broadcasts the latest frame to connected WebSocket clients.
+    - Forwards browser input to the UI and refuses it while openpilot is engaged (the browser shows a banner).
+    - Serves the browser client: `remote_ui_client.js`, `remote_ui.css` and the PWA manifest `remote_ui.webmanifest`.
 
 - `screenshot_server.py` (legacy)
     - Older polling server that serves PNG screenshots from `/tmp/ui_frame_*.png`.
@@ -72,7 +81,9 @@ struct SharedFrame {
     uint32_t size;        // JPEG byte length
     uint32_t format;      // 1 = JPEG
     uint8_t ready;
-    uint8_t padding[6];
+    uint16_t source_width;   // UI size before scaling (input coordinates use it)
+    uint16_t source_height;
+    uint8_t padding[2];
     uint8_t data[4 * 1920 * 1080];
 };
 ```
@@ -99,7 +110,7 @@ The installer:
 
 Restart the UI (or reboot) and open `http://DEVICE_IP:8081`.
 
-`remote_ui_auto` wraps `pyray.end_drawing` to capture each frame before the buffer swap, starts `RemoteUI` once the window exists, and launches `stream_server.py` itself. No render-loop edits or launch-script changes are needed. Set `OP_REMOTE_UI=0` to disable it without uninstalling.
+`remote_ui_auto` wraps `pyray.end_drawing` to capture each frame before the buffer swap, launches `stream_server.py` itself, and starts `RemoteUI` when the first browser connects. No render-loop edits or launch-script changes are needed. Set `OP_REMOTE_UI=0` to disable it without uninstalling.
 
 To remove: `./uninstall.sh [OPENPILOT_DIR]`. openpilot updates may reset `ui.py`; just re-run `install.sh`.
 
@@ -112,7 +123,8 @@ from remote_ui import RemoteUI
 
 remote = RemoteUI()          # after the window/GL context exists
 ...
-remote.stream_frame()        # each frame, before end_drawing
+remote.update()              # each frame
+remote.stream_frame()        # each frame while a browser is connected, before end_drawing
 ...
 remote.close()
 ```
@@ -121,15 +133,16 @@ Then run `python3 stream_server.py` yourself.
 
 ## Endpoints
 
-- `GET /` : Built-in HTML viewer
-- `WS /stream` : Real-time frame stream
-- `POST /input` : Remote input events (JSON)
+- `GET /` : Built-in HTML viewer (installable as a PWA)
+- `GET /remote_ui.js`, `/remote_ui.css`, `/remote_ui.webmanifest` : Browser client assets
+- `WS /stream` : Real-time frame stream, plus input, feedback and view-size messages from the browser
+- `POST /input` : Remote input events (JSON), fallback when the WebSocket is down
 - `GET /stats` : Cache/client stats
 - `GET /stream-sse` : SSE fallback stream
 
 ## Input Event Format
 
-Input payloads are JSON sent to `POST /input` and forwarded to `/tmp/ui_touch_socket`.
+Input events are JSON, sent over the WebSocket as `{"type":"input","event":{...}}` or to `POST /input`, and forwarded to `/tmp/ui_touch_socket`.
 
 Examples:
 
@@ -143,6 +156,14 @@ Examples:
 
 ```json
 {"type":"drag","x":1200,"y":600,"startX":1080,"startY":540}
+```
+
+```json
+{"type":"keytap","key":"Enter"}
+```
+
+```json
+{"type":"text","text":"pasted text"}
 ```
 
 ## Smoke Testing
@@ -164,12 +185,12 @@ Run it directly from this directory (`python3 remote_ui.py`); imports are flat, 
 
 1. Confirm socket exists: `ls -lh /tmp/ui_touch_socket`
 2. Confirm `TouchInjector` was started (`RemoteUI()` created successfully).
-3. Confirm browser requests to `/input` are succeeding (HTTP 200).
+3. Remote input is ignored while openpilot is engaged; the browser shows a banner when it is.
 
 ### Latency is high
 
 1. Check network quality between browser and host.
-2. Lower JPEG quality or capture rate in `frame_streamer.py`.
+2. Quality and frame rate adapt automatically; the limits are the `*_JPEG_QUALITY` and `*_FRAME_RATE_LIMIT` constants in `frame_streamer.py`.
 3. Reduce competing load on the UI host.
 
 ## Notes

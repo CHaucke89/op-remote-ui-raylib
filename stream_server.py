@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-OpenPilot UI Streaming Server - Real-time WebSocket streaming
+openpilot Remote UI streaming server.
+
+Reads JPEG frames that ``frame_streamer.py`` writes into shared memory and
+broadcasts them to browsers over WebSocket, forwarding their input back to the
+UI's ``touch_injector.py``. Serves the browser client, which can be installed
+as a PWA.
 """
 
 import os
-import sys
 import time
 import json
 import socket
@@ -13,16 +17,18 @@ import mmap
 import subprocess
 import threading
 import base64
-import queue
+import sys
 from collections import deque
 
-# install.sh installs dependencies into ./vendor next to this file.
-_vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-if os.path.isdir(_vendor):
-  sys.path.insert(0, _vendor)
+# Flat imports: this directory and its ./vendor deps (installed by install.sh).
+HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (HERE, os.path.join(HERE, "vendor")):
+  if os.path.isdir(_p) and _p not in sys.path:
+    sys.path.insert(0, _p)
 
-from flask import Flask, render_template_string, request, jsonify, Response
-from flask_sock import Sock
+from flask import Flask, render_template_string, request, jsonify, Response, send_from_directory  # noqa: E402
+from flask_sock import Sock  # noqa: E402
+from client_state import ClientStateWriter  # noqa: E402
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -35,10 +41,114 @@ FRAME_DATA_SIZE = 4 * 1920 * 1080  # 8,294,400 bytes
 METADATA_SIZE = 31  # Packed struct metadata
 SHM_SIZE = METADATA_SIZE + FRAME_DATA_SIZE  # Total size
 
-# Global queue for frame distribution
-frame_queue = queue.Queue(maxsize=10)
+TOUCH_SOCKET_PATH = '/tmp/ui_touch_socket'
+
+# Binary frame message: type(1) + timestamp ms(8) + width(4) + height(4) + source width(2) + source height(2),
+# then JPEG bytes. Source size is the UI's real resolution, which input coordinates are in.
+FRAME_MSG_TYPE = 1
+FRAME_HEADER_FMT = '<BQIIHH'
+
+# Client feedback older than this no longer counts towards the published network delay
+FEEDBACK_STALE_S = 3.0
+
 websocket_clients = set()
 clients_lock = threading.Lock()
+client_state: ClientStateWriter | None = None
+client_feedback: dict[int, tuple[float, float]] = {}  # client id -> (monotonic time, queue delay ms)
+client_view_widths: dict[int, int] = {}  # client id -> frame width the browser wants
+
+
+def publish_requested_width():
+  """One encode is shared by every client, so the widest request wins. Caller holds clients_lock."""
+  if client_state is not None:
+    client_state.set_requested_width(max(client_view_widths.values(), default=0))
+
+
+def publish_network_delay():
+  """Publish the worst fresh client queue delay so the UI can back off. Caller holds clients_lock."""
+  now = time.monotonic()
+  for cid in [cid for cid, (t, _) in client_feedback.items() if now - t > FEEDBACK_STALE_S]:
+    del client_feedback[cid]
+  if client_state is not None:
+    client_state.set_network_delay_ms(max((d for _, d in client_feedback.values()), default=0))
+
+
+class InputForwarder:
+  """Keeps one connection to the UI's touch injector and streams newline-delimited JSON over it."""
+
+  def __init__(self, path=TOUCH_SOCKET_PATH):
+    self.path = path
+    self.sock = None
+    self.lock = threading.Lock()
+
+  def _connect(self):
+    self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    self.sock.settimeout(0.5)
+    self.sock.connect(self.path)
+
+  def _close(self):
+    if self.sock is not None:
+      try:
+        self.sock.close()
+      except OSError:
+        pass
+      self.sock = None
+
+  def send(self, event: dict):
+    payload = (json.dumps({**event, 'timestamp': time.monotonic()}) + '\n').encode()
+    with self.lock:
+      # Retry once with a fresh connection in case the UI restarted.
+      for attempt in range(2):
+        try:
+          if self.sock is None:
+            self._connect()
+          assert self.sock is not None
+          self.sock.sendall(payload)
+          return
+        except OSError:
+          self._close()
+          if attempt:
+            raise
+
+
+input_forwarder = InputForwarder()
+
+
+class DriveState:
+  """Tracks whether openpilot is engaged so remote input can be refused while driving."""
+
+  def __init__(self):
+    self.engaged = False
+
+  def start(self):
+    try:
+      try:
+        from openpilot.cereal import messaging
+      except ImportError:
+        import cereal.messaging as messaging
+    except ImportError as e:
+      # The UI process applies the same gate, so this only costs the browser banner.
+      print(f"DriveState: cereal unavailable, not gating input here: {e}")
+      return
+
+    # selfdriveStateSP (MADS) only exists on sunnypilot-based forks.
+    try:
+      sm = messaging.SubMaster(['deviceState', 'selfdriveState', 'selfdriveStateSP'])
+      has_sp = True
+    except Exception:
+      sm = messaging.SubMaster(['deviceState', 'selfdriveState'])
+      has_sp = False
+
+    def loop():
+      while True:
+        sm.update(200)
+        enabled = sm['selfdriveState'].enabled or (has_sp and sm['selfdriveStateSP'].mads.enabled)
+        self.engaged = bool(sm['deviceState'].started and enabled)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+drive_state = DriveState()
 
 
 # Frame cache for efficient streaming
@@ -49,10 +159,13 @@ class FrameCache:
     self.latest_timestamp = 0
     self.latest_frame = None
 
-  def add_frame(self, timestamp: int, data: bytes, width: int, height: int):
+  def add_frame(self, timestamp: int, data: bytes, width: int, height: int, source_width: int = 0, source_height: int = 0):
     with self.lock:
       if timestamp > self.latest_timestamp:
-        frame_info = {'timestamp': timestamp, 'data': data, 'size': len(data), 'width': width, 'height': height}
+        # Pack the WebSocket message once here instead of once per client.
+        packet = struct.pack(FRAME_HEADER_FMT, FRAME_MSG_TYPE, timestamp, width, height,
+                             source_width or width, source_height or height) + data
+        frame_info = {'timestamp': timestamp, 'data': data, 'packet': packet, 'size': len(data), 'width': width, 'height': height}
         self.frames.append(frame_info)
         self.latest_timestamp = timestamp
         self.latest_frame = frame_info
@@ -81,7 +194,7 @@ class SharedMemoryReader:
     self.last_timestamp = 0
 
   def connect(self):
-    """Connect to shared memory created by Qt application"""
+    """Connect to shared memory created by the UI's FrameStreamer"""
     try:
       # Open existing shared memory
       shm_path = f"/dev/shm{SHM_NAME}"
@@ -130,8 +243,9 @@ class SharedMemoryReader:
       format_type = struct.unpack('<I', self.shm_map.read(4))[0]  # uint32_t
       ready = struct.unpack('B', self.shm_map.read(1))[0]  # uint8_t
 
-      # Skip 6 bytes of padding
-      self.shm_map.read(6)
+      # Source (pre-scaling) size, then 2 bytes of padding. Zero from writers that predate scaling.
+      source_width, source_height = struct.unpack('<HH', self.shm_map.read(4))
+      self.shm_map.read(2)
 
       if ready == 0 or size == 0 or timestamp <= self.last_timestamp:
         return None
@@ -141,7 +255,8 @@ class SharedMemoryReader:
 
       self.last_timestamp = timestamp
 
-      return {'timestamp': timestamp, 'width': width, 'height': height, 'size': size, 'format': 'jpeg' if format_type == 1 else 'raw', 'data': frame_data}
+      return {'timestamp': timestamp, 'width': width, 'height': height, 'source_width': source_width, 'source_height': source_height,
+              'size': size, 'format': 'jpeg' if format_type == 1 else 'raw', 'data': frame_data}
     except Exception as e:
       print(f"Error reading frame: {e}")
       return None
@@ -169,33 +284,8 @@ class SharedMemoryReader:
         if frame:
           frame_count += 1
           # Add to cache
-          if frame_cache.add_frame(frame['timestamp'], frame['data'], frame['width'], frame['height']):
-            # Broadcast to all WebSocket clients
-            with clients_lock:
-              if websocket_clients:
-                # Create frame message
-                frame_msg = json.dumps(
-                  {
-                    'type': 'frame',
-                    'timestamp': frame['timestamp'],
-                    'width': frame['width'],
-                    'height': frame['height'],
-                    'format': frame['format'],
-                    'data': base64.b64encode(frame['data']).decode('utf-8'),
-                  }
-                )
-
-                # Add to queue for all clients
-                try:
-                  frame_queue.put_nowait(frame_msg)
-                except queue.Full:
-                  # Remove oldest frame if queue is full
-                  try:
-                    frame_queue.get_nowait()
-                    frame_queue.put_nowait(frame_msg)
-                  except Exception:
-                    pass
-
+          if frame_cache.add_frame(frame['timestamp'], frame['data'], frame['width'], frame['height'],
+                                   frame['source_width'], frame['source_height']):
             # Debug: Check if frame data is valid JPEG
             if frame_count % 10 == 0:
               # Check JPEG header
@@ -226,114 +316,15 @@ HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-  <title>OpenPilot UI Stream - Real-Time</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {
-      margin: 0;
-      background: #000;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-      overflow: hidden;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    #ui-container {
-      position: relative;
-      max-width: 100%;
-      max-height: 100%;
-    }
-    #ui {
-      width: 100%;
-      height: auto;
-      touch-action: none;
-      user-select: none;
-      image-rendering: optimizeSpeed;
-      display: block;
-    }
-    .status {
-      position: absolute;
-      top: 10px;
-      left: 10px;
-      color: #fff;
-      background: rgba(0,0,0,0.8);
-      padding: 8px 12px;
-      border-radius: 8px;
-      font-size: 13px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      backdrop-filter: blur(10px);
-      z-index: 100;
-    }
-    .status-indicator {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #ff4444;
-      animation: pulse 2s infinite;
-    }
-    .status-indicator.connected {
-      background: #44ff44;
-      animation: none;
-    }
-    .status-indicator.streaming {
-      background: #44ff44;
-      animation: pulse 1s infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.3; }
-    }
-    .stats {
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      color: #fff;
-      background: rgba(0,0,0,0.8);
-      padding: 8px 12px;
-      border-radius: 8px;
-      font-size: 11px;
-      font-family: monospace;
-      backdrop-filter: blur(10px);
-      z-index: 100;
-    }
-    .touch-indicator {
-      position: absolute;
-      width: 40px;
-      height: 40px;
-      border: 2px solid #00ff00;
-      border-radius: 50%;
-      background: rgba(0, 255, 0, 0.2);
-      pointer-events: none;
-      transform: translate(-50%, -50%);
-      animation: fadeOut 0.5s ease-out forwards;
-      z-index: 200;
-    }
-    @keyframes fadeOut {
-      0% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-      100% { opacity: 0; transform: translate(-50%, -50%) scale(1.5); }
-    }
-    .loading {
-      color: #fff;
-      text-align: center;
-      padding: 20px;
-      font-size: 18px;
-    }
-    #debug {
-      position: absolute;
-      bottom: 10px;
-      left: 10px;
-      color: #0f0;
-      background: rgba(0,0,0,0.8);
-      padding: 5px;
-      font-family: monospace;
-      font-size: 10px;
-      max-width: 300px;
-      z-index: 100;
-    }
-  </style>
+  <title>openpilot Remote UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, maximum-scale=1">
+  <meta name="theme-color" content="#000000">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Remote UI">
+  <link rel="manifest" href="/remote_ui.webmanifest">
+  <link rel="stylesheet" href="/remote_ui.css">
 </head>
 <body>
   <div id="ui-container">
@@ -346,303 +337,10 @@ HTML_PAGE = """
       FPS: 0 | Frames: 0 | Latency: 0ms
     </div>
     <div id="debug"></div>
+    <button id="res-toggle" type="button" title="Stream resolution">Res: Auto</button>
   </div>
 
-  <script>
-    const canvas = document.getElementById('ui');
-    const ctx = canvas.getContext('2d', { alpha: false });
-    const container = document.getElementById('ui-container');
-    const statusIndicator = document.getElementById('status-indicator');
-    const statusText = document.getElementById('status-text');
-    const stats = document.getElementById('stats');
-    const debug = document.getElementById('debug');
-
-    let ws = null;
-    let reconnectTimer = null;
-    let frameCount = 0;
-    let totalFrames = 0;
-    let fps = 0;
-    let lastFpsTime = Date.now();
-    let latency = 0;
-    let isConnected = false;
-    let lastFrameTime = 0;
-
-    // Optimized image rendering
-    const imagePool = [];
-    let currentImageIndex = 0;
-
-    // Pre-create image objects for better performance
-    for (let i = 0; i < 3; i++) {
-      imagePool.push(new Image());
-    }
-
-    // FPS calculation
-    function updateStats() {
-      const now = Date.now();
-      const elapsed = now - lastFpsTime;
-      if (elapsed >= 1000) {
-        fps = Math.round((frameCount * 1000) / elapsed);
-        frameCount = 0;
-        lastFpsTime = now;
-      }
-      stats.textContent = `FPS: ${fps} | Frames: ${totalFrames} | Latency: ${latency}ms`;
-    }
-
-    function renderFrame(frameData) {
-      const img = imagePool[currentImageIndex];
-      currentImageIndex = (currentImageIndex + 1) % imagePool.length;
-
-      img.onload = function() {
-        // Update canvas size if needed
-        if (canvas.width !== img.width || canvas.height !== img.height) {
-          canvas.width = img.width;
-          canvas.height = img.height;
-        }
-
-        // Draw frame
-        ctx.drawImage(img, 0, 0);
-
-        frameCount++;
-        totalFrames++;
-        lastFrameTime = Date.now();
-        updateStats();
-      };
-
-      img.onerror = function() {
-        console.error('Failed to load frame');
-      };
-
-      // Set image source
-      img.src = 'data:image/jpeg;base64,' + frameData;
-    }
-
-    function connectWebSocket() {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/stream`;
-
-      console.log('Connecting to WebSocket:', wsUrl);
-      debug.textContent = `Connecting to ${wsUrl}...`;
-
-      ws = new WebSocket(wsUrl);
-
-      ws.binaryType = 'arraybuffer';
-
-      ws.onopen = () => {
-        console.log('WebSocket connected');
-        isConnected = true;
-        statusIndicator.className = 'status-indicator connected';
-        statusText.textContent = 'Connected - Waiting for frames';
-        debug.textContent = 'Connected successfully';
-
-        if (reconnectTimer) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
-
-        // Request initial frame
-        ws.send(JSON.stringify({ type: 'request_frame' }));
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-
-          if (message.type === 'frame') {
-            const receiveTime = Date.now();
-            latency = Math.max(0, receiveTime - message.timestamp);
-
-            // Update status to show streaming
-            statusIndicator.className = 'status-indicator streaming';
-            statusText.textContent = 'Streaming';
-
-            // Render frame
-            renderFrame(message.data);
-
-            debug.textContent = `Frame received: ${message.width}x${message.height}, ${latency}ms latency`;
-          } else if (message.type === 'stats') {
-            debug.textContent = `Server stats: ${message.frames_cached} frames, ${message.memory_kb}KB`;
-          }
-        } catch (e) {
-          console.error('Error processing message:', e);
-          debug.textContent = `Error: ${e.message}`;
-        }
-      };
-
-      ws.onclose = (event) => {
-        console.log('WebSocket disconnected:', event.code, event.reason);
-        isConnected = false;
-        statusIndicator.className = 'status-indicator';
-        statusText.textContent = 'Disconnected - Reconnecting...';
-        debug.textContent = `Disconnected: ${event.reason || 'Connection lost'}`;
-
-        // Reconnect after 2 seconds
-        if (!reconnectTimer) {
-          reconnectTimer = setTimeout(connectWebSocket, 2000);
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        debug.textContent = `WebSocket error occurred`;
-      };
-    }
-
-    // Check for stale frames
-    setInterval(() => {
-      if (isConnected && Date.now() - lastFrameTime > 5000) {
-        debug.textContent = 'No frames received for 5 seconds';
-        // Request a frame
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'request_frame' }));
-        }
-      }
-    }, 5000);
-
-    // Touch/click handling
-    function getDeviceCoordinates(clientX, clientY) {
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      return {
-        x: Math.round((clientX - rect.left) * scaleX),
-        y: Math.round((clientY - rect.top) * scaleY)
-      };
-    }
-
-    function sendInput(eventData) {
-      fetch('/input', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(eventData)
-      }).catch(err => console.error('Input send failed:', err));
-    }
-
-    function showTouchIndicator(x, y) {
-      const indicator = document.createElement('div');
-      indicator.className = 'touch-indicator';
-      const rect = canvas.getBoundingClientRect();
-      indicator.style.left = (x + rect.left) + 'px';
-      indicator.style.top = (y + rect.top) + 'px';
-      container.appendChild(indicator);
-      setTimeout(() => container.removeChild(indicator), 500);
-    }
-
-    let mouseDown = false;
-    let dragActive = false;
-    let dragStartX = 0;
-    let dragStartY = 0;
-    const dragThreshold = 8;
-
-    // Mouse events
-    canvas.addEventListener('mousedown', (e) => {
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      mouseDown = true;
-      dragActive = false;
-      dragStartX = e.clientX;
-      dragStartY = e.clientY;
-      sendInput({ type: 'mousedown', x: coords.x, y: coords.y });
-    });
-
-    canvas.addEventListener('mousemove', (e) => {
-      if (!mouseDown) {
-        return;
-      }
-
-      const moved = Math.hypot(e.clientX - dragStartX, e.clientY - dragStartY);
-      if (moved >= dragThreshold) {
-        dragActive = true;
-      }
-
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      sendInput({ type: dragActive ? 'drag' : 'mousemove', x: coords.x, y: coords.y });
-    });
-
-    canvas.addEventListener('mouseup', (e) => {
-      if (!mouseDown) {
-        return;
-      }
-
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      sendInput({ type: dragActive ? 'dragend' : 'mouseup', x: coords.x, y: coords.y });
-      mouseDown = false;
-      dragActive = false;
-    });
-
-    canvas.addEventListener('mouseleave', (e) => {
-      if (!mouseDown) {
-        return;
-      }
-
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      sendInput({ type: dragActive ? 'dragend' : 'mouseup', x: coords.x, y: coords.y });
-      mouseDown = false;
-      dragActive = false;
-    });
-
-    canvas.addEventListener('click', (e) => {
-      if (dragActive) {
-        dragActive = false;
-        return;
-      }
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      showTouchIndicator(e.clientX - canvas.getBoundingClientRect().left,
-                        e.clientY - canvas.getBoundingClientRect().top);
-      sendInput({ type: 'click', x: coords.x, y: coords.y });
-    });
-
-    canvas.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      sendInput({ type: 'scroll', x: coords.x, y: coords.y, deltaY: e.deltaY });
-    }, { passive: false });
-
-    // Touch events
-    canvas.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      if (e.touches.length === 1) {
-        const touch = e.touches[0];
-        const coords = getDeviceCoordinates(touch.clientX, touch.clientY);
-        sendInput({ type: 'touchstart', x: coords.x, y: coords.y });
-      }
-    }, { passive: false });
-
-    canvas.addEventListener('touchmove', (e) => {
-      e.preventDefault();
-      if (e.touches.length === 1) {
-        const touch = e.touches[0];
-        const coords = getDeviceCoordinates(touch.clientX, touch.clientY);
-        sendInput({ type: 'touchmove', x: coords.x, y: coords.y });
-      }
-    }, { passive: false });
-
-    canvas.addEventListener('touchend', (e) => {
-      e.preventDefault();
-      const touch = e.changedTouches[0];
-      if (touch) {
-        const coords = getDeviceCoordinates(touch.clientX, touch.clientY);
-        sendInput({ type: 'touchend', x: coords.x, y: coords.y });
-      } else {
-        sendInput({ type: 'touchend' });
-      }
-    }, { passive: false });
-
-    canvas.addEventListener('touchcancel', (e) => {
-      e.preventDefault();
-      const touch = e.changedTouches[0];
-      if (touch) {
-        const coords = getDeviceCoordinates(touch.clientX, touch.clientY);
-        sendInput({ type: 'touchend', x: coords.x, y: coords.y });
-      } else {
-        sendInput({ type: 'touchend' });
-      }
-    }, { passive: false });
-
-    // Start WebSocket connection
-    connectWebSocket();
-
-    // Update stats periodically
-    setInterval(updateStats, 100);
-  </script>
+  <script src="/remote_ui.js"></script>
 </body>
 </html>
 """
@@ -653,103 +351,141 @@ def index():
   return render_template_string(HTML_PAGE)
 
 
+@app.route('/remote_ui.js')
+def remote_ui_js():
+  return send_from_directory(HERE, 'remote_ui_client.js')
+
+
+@app.route('/remote_ui.css')
+def remote_ui_css():
+  return send_from_directory(HERE, 'remote_ui.css')
+
+
+@app.route('/remote_ui.webmanifest')
+def remote_ui_manifest():
+  return send_from_directory(HERE, 'remote_ui.webmanifest')
+
+
+def forward_input(event) -> bool:
+  """Forward one input event to the UI. Returns False if it was dropped."""
+  if not isinstance(event, dict) or drive_state.engaged:
+    return False
+  try:
+    input_forwarder.send(event)
+    return True
+  except OSError as e:
+    print(f"Failed to send input event: {e}")
+    return False
+
+
 @app.route('/input', methods=['POST'])
 def handle_input():
-  """Handle input events from web client"""
-  data = request.get_json()
-  event_type = data.get('type', 'click')
-  print(f"Received {event_type} event: {data}")
+  """Handle input events from web client (fallback for when the WebSocket is down)"""
+  data = request.get_json(silent=True)
+  if drive_state.engaged:
+    return jsonify({'status': 'blocked', 'message': 'Remote input is disabled while engaged'}), 409
+  if not forward_input(data):
+    return jsonify({'status': 'error', 'message': 'Failed to send input event'}), 500
+  return jsonify({'status': 'success'})
 
-  # Send to Qt application via Unix socket
+
+def handle_client_message(ws, client_id, data):
   try:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-      sock.connect('/tmp/ui_touch_socket')
-      message = json.dumps({**data, 'timestamp': time.monotonic()})
-      sock.send(message.encode())
-      return jsonify({'status': 'success'})
-  except Exception as e:
-    print(f"Failed to send input event: {e}")
-    return jsonify({'status': 'error', 'message': str(e)}), 500
+    msg = json.loads(data)
+  except (json.JSONDecodeError, TypeError):
+    return
+  if not isinstance(msg, dict):
+    return
+
+  msg_type = msg.get('type')
+  if msg_type == 'input':
+    forward_input(msg.get('event'))
+  elif msg_type == 'feedback':
+    try:
+      queue_delay = max(0.0, float(msg.get('queue_delay_ms', 0)))
+    except (TypeError, ValueError):
+      return
+    with clients_lock:
+      client_feedback[client_id] = (time.monotonic(), queue_delay)
+      publish_network_delay()
+  elif msg_type == 'view':
+    try:
+      width = max(0, int(msg.get('width', 0)))
+    except (TypeError, ValueError):
+      return
+    with clients_lock:
+      client_view_widths[client_id] = width
+      publish_requested_width()
+  elif msg_type == 'request_frame':
+    latest = frame_cache.get_latest()
+    if latest:
+      ws.send(latest['packet'])
 
 
 @sock.route('/stream')
 def stream(ws):
-  """WebSocket endpoint for real-time frame streaming"""
+  """WebSocket endpoint for real-time frame streaming and input"""
   client_id = id(ws)
   print(f"Client {client_id} connected")
 
   with clients_lock:
     websocket_clients.add(ws)
     client_count = len(websocket_clients)
+    if client_state is not None:
+      client_state.set_client_count(client_count)
 
   print(f"Total clients: {client_count}")
 
   try:
+    last_sent_timestamp = 0
+    last_stats_sent = 0.0
+    input_blocked = None
+
     # Send current frame immediately if available
     latest = frame_cache.get_latest()
     if latest:
-      initial_msg = json.dumps(
-        {
-          'type': 'frame',
-          'timestamp': latest['timestamp'],
-          'width': latest['width'],
-          'height': latest['height'],
-          'format': 'jpeg',
-          'data': base64.b64encode(latest['data']).decode('utf-8'),
-        }
-      )
-      ws.send(initial_msg)
+      ws.send(latest['packet'])
+      last_sent_timestamp = latest['timestamp']
       print(f"Sent initial frame to client {client_id}")
 
     # Main streaming loop
     while True:
       try:
-        # Wait for new frames with timeout
-        frame_msg = frame_queue.get(timeout=5)
+        if drive_state.engaged != input_blocked:
+          input_blocked = drive_state.engaged
+          ws.send(json.dumps({'type': 'status', 'input_blocked': input_blocked}))
 
-        # Send frame to this client
-        ws.send(frame_msg)
-
-        # Clear the queue item
-        frame_queue.task_done()
-
-      except queue.Empty:
-        # Send keepalive/stats
-        stats = frame_cache.get_stats()
-        ws.send(json.dumps({'type': 'stats', 'frames_cached': stats['frames_cached'], 'memory_kb': stats['total_memory_kb']}))
+        latest = frame_cache.get_latest()
+        if latest and latest['timestamp'] > last_sent_timestamp:
+          ws.send(latest['packet'])
+          last_sent_timestamp = latest['timestamp']
+        elif (time.monotonic() - last_stats_sent) >= 5.0:
+          stats = frame_cache.get_stats()
+          ws.send(json.dumps({'type': 'stats', 'frames_cached': stats['frames_cached'], 'memory_kb': stats['total_memory_kb']}))
+          last_stats_sent = time.monotonic()
       except Exception as e:
         print(f"Error sending to client {client_id}: {e}")
         break
 
-      # Check for client messages (like frame requests)
-      data = ws.receive(timeout=0)
-      if data:
-        try:
-          msg = json.loads(data)
-          if msg.get('type') == 'request_frame':
-            latest = frame_cache.get_latest()
-            if latest:
-              ws.send(
-                json.dumps(
-                  {
-                    'type': 'frame',
-                    'timestamp': latest['timestamp'],
-                    'width': latest['width'],
-                    'height': latest['height'],
-                    'format': 'jpeg',
-                    'data': base64.b64encode(latest['data']).decode('utf-8'),
-                  }
-                )
-              )
-        except (json.JSONDecodeError, TypeError):
-          pass
+      # Wait for client messages (input, feedback, frame requests) instead of sleeping, so
+      # input is forwarded as soon as it arrives. Then drain anything else already queued.
+      data = ws.receive(timeout=0.02)
+      while data:
+        handle_client_message(ws, client_id, data)
+        data = ws.receive(timeout=0)
 
   except Exception as e:
     print(f"Client {client_id} error: {e}")
   finally:
     with clients_lock:
       websocket_clients.discard(ws)
+      client_feedback.pop(client_id, None)
+      client_view_widths.pop(client_id, None)
       client_count = len(websocket_clients)
+      if client_state is not None:
+        client_state.set_client_count(client_count)
+      publish_network_delay()
+      publish_requested_width()
     print(f"Client {client_id} disconnected. Total clients: {client_count}")
 
 
@@ -806,10 +542,12 @@ def wait_for_wifi(interface="wlan0", timeout=10, delay=2):
 
 
 def main() -> None:
+  global client_state
+  client_state = ClientStateWriter()
   wait_for_wifi()
 
   print("=" * 60)
-  print("🚀 OpenPilot UI Real-Time Streaming Server")
+  print("openpilot Remote UI Streaming Server")
   print("=" * 60)
   print("✅ Zero disk storage - Memory only")
   print("✅ WebSocket real-time streaming")
@@ -818,11 +556,13 @@ def main() -> None:
 
   # Start shared memory monitoring
   shm_reader.start_monitoring()
+  drive_state.start()
 
   # Run Flask with WebSocket support
   try:
     app.run(host='0.0.0.0', port=8081, debug=False)
   finally:
+    client_state.close()
     shm_reader.close()
 
 
