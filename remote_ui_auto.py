@@ -1,15 +1,7 @@
-"""Zero-integration entrypoint: ``import remote_ui_auto`` and you're done.
+"""Zero-integration hook: ``import remote_ui_auto`` wraps ``pyray.end_drawing`` and starts the server.
 
-Wraps ``pyray.end_drawing`` so every frame is captured just before the buffer
-swap and launches ``stream_server.py`` as a subprocess. No edits to the render
-loop are needed.
-
-Like cloudypilot, nothing is captured or hooked until a browser connects:
-``RemoteUI`` is created when ``stream_server`` reports its first client, and
-frames are only streamed while at least one client is connected.
-
-Set ``OP_REMOTE_UI=0`` in the environment to disable. Any failure here is
-swallowed so it can never take the openpilot UI down.
+RemoteUI is created on the first browser connection. Set ``OP_REMOTE_UI=0`` to disable.
+Failures are swallowed so they can never take the UI down.
 """
 
 import atexit
@@ -45,9 +37,9 @@ def _server_listening() -> bool:
 def _start_server():
   global _server
   if _server_listening():
-    return  # already running (e.g. started by hand or left over)
+    return  # already running
   env = dict(os.environ)
-  # Give the server the UI's import path too, so it can reach openpilot's cereal for the engaged check.
+  # Share the UI's import path so the server can reach cereal.
   paths = [VENDOR, HERE, env.get("PYTHONPATH", ""), *(p for p in sys.path if p and os.path.isdir(p))]
   env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(p for p in paths if p))
   _server = subprocess.Popen(

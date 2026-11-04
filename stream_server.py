@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-openpilot Remote UI streaming server.
-
-Reads JPEG frames that ``frame_streamer.py`` writes into shared memory and
-broadcasts them to browsers over WebSocket, forwarding their input back to the
-UI's ``touch_injector.py``. Serves the browser client, which can be installed
-as a PWA.
-"""
+"""Streams UI frames from shared memory to browsers over WebSocket and forwards their input to the UI."""
 
 import os
 import time
@@ -20,7 +13,7 @@ import base64
 import sys
 from collections import deque
 
-# Flat imports: this directory and its ./vendor deps (installed by install.sh).
+# Flat imports from this directory and ./vendor.
 HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (HERE, os.path.join(HERE, "vendor")):
   if os.path.isdir(_p) and _p not in sys.path:
@@ -33,22 +26,19 @@ from client_state import ClientStateWriter  # noqa: E402
 app = Flask(__name__)
 sock = Sock(app)
 
-# Shared memory configuration
 SHM_NAME = "/openpilot_ui_frames"
-# Match C++ SharedFrame packed struct:
-# timestamp(8) + width(4) + height(4) + size(4) + format(4) + ready(1) + padding(6) = 31 bytes, then data
-FRAME_DATA_SIZE = 4 * 1920 * 1080  # 8,294,400 bytes
-METADATA_SIZE = 31  # Packed struct metadata
-SHM_SIZE = METADATA_SIZE + FRAME_DATA_SIZE  # Total size
+# Packed 31-byte header (see frame_streamer.HEADER_FMT), then JPEG data.
+FRAME_DATA_SIZE = 4 * 1920 * 1080
+METADATA_SIZE = 31
+SHM_SIZE = METADATA_SIZE + FRAME_DATA_SIZE
 
 TOUCH_SOCKET_PATH = '/tmp/ui_touch_socket'
 
-# Binary frame message: type(1) + timestamp ms(8) + width(4) + height(4) + source width(2) + source height(2),
-# then JPEG bytes. Source size is the UI's real resolution, which input coordinates are in.
+# Binary frame message header, then JPEG. Source size is the UI resolution input coordinates use.
 FRAME_MSG_TYPE = 1
 FRAME_HEADER_FMT = '<BQIIHH'
 
-# Client feedback older than this no longer counts towards the published network delay
+# Client delay reports expire after this long.
 FEEDBACK_STALE_S = 3.0
 
 websocket_clients = set()
@@ -59,13 +49,13 @@ client_view_widths: dict[int, int] = {}  # client id -> frame width the browser 
 
 
 def publish_requested_width():
-  """One encode is shared by every client, so the widest request wins. Caller holds clients_lock."""
+  """All clients share one encode, so the widest request wins. Caller holds clients_lock."""
   if client_state is not None:
     client_state.set_requested_width(max(client_view_widths.values(), default=0))
 
 
 def publish_network_delay():
-  """Publish the worst fresh client queue delay so the UI can back off. Caller holds clients_lock."""
+  """Publish the worst recent client delay. Caller holds clients_lock."""
   now = time.monotonic()
   for cid in [cid for cid, (t, _) in client_feedback.items() if now - t > FEEDBACK_STALE_S]:
     del client_feedback[cid]
@@ -74,7 +64,7 @@ def publish_network_delay():
 
 
 class InputForwarder:
-  """Keeps one connection to the UI's touch injector and streams newline-delimited JSON over it."""
+  """Persistent newline-delimited JSON connection to the UI's touch injector."""
 
   def __init__(self, path=TOUCH_SOCKET_PATH):
     self.path = path
@@ -97,7 +87,7 @@ class InputForwarder:
   def send(self, event: dict):
     payload = (json.dumps({**event, 'timestamp': time.monotonic()}) + '\n').encode()
     with self.lock:
-      # Retry once with a fresh connection in case the UI restarted.
+      # Retry once in case the UI restarted.
       for attempt in range(2):
         try:
           if self.sock is None:
@@ -115,7 +105,7 @@ input_forwarder = InputForwarder()
 
 
 class DriveState:
-  """Tracks whether openpilot is engaged so remote input can be refused while driving."""
+  """Tracks engagement so remote input can be refused while driving."""
 
   def __init__(self):
     self.engaged = False
@@ -127,7 +117,7 @@ class DriveState:
       except ImportError:
         import cereal.messaging as messaging
     except ImportError as e:
-      # The UI process applies the same gate, so this only costs the browser banner.
+      # The UI applies the same gate; only the browser banner is lost.
       print(f"DriveState: cereal unavailable, not gating input here: {e}")
       return
 
@@ -151,7 +141,6 @@ class DriveState:
 drive_state = DriveState()
 
 
-# Frame cache for efficient streaming
 class FrameCache:
   def __init__(self, max_frames=3):
     self.frames = deque(maxlen=max_frames)
@@ -162,7 +151,7 @@ class FrameCache:
   def add_frame(self, timestamp: int, data: bytes, width: int, height: int, source_width: int = 0, source_height: int = 0):
     with self.lock:
       if timestamp > self.latest_timestamp:
-        # Pack the WebSocket message once here instead of once per client.
+        # Pack once, not per client.
         packet = struct.pack(FRAME_HEADER_FMT, FRAME_MSG_TYPE, timestamp, width, height,
                              source_width or width, source_height or height) + data
         frame_info = {'timestamp': timestamp, 'data': data, 'packet': packet, 'size': len(data), 'width': width, 'height': height}
@@ -185,7 +174,6 @@ class FrameCache:
 frame_cache = FrameCache()
 
 
-# Shared memory reader
 class SharedMemoryReader:
   def __init__(self):
     self.shm_fd = None
@@ -196,10 +184,8 @@ class SharedMemoryReader:
   def connect(self):
     """Connect to shared memory created by the UI's FrameStreamer"""
     try:
-      # Open existing shared memory
       shm_path = f"/dev/shm{SHM_NAME}"
 
-      # Check if file exists and get its size
       if os.path.exists(shm_path):
         stat_info = os.stat(shm_path)
         actual_size = stat_info.st_size
@@ -209,13 +195,11 @@ class SharedMemoryReader:
           return False
         elif actual_size < SHM_SIZE:
           print(f"Shared memory exists but is smaller than expected: {actual_size} < {SHM_SIZE}")
-          # Try to map with the actual size instead
           self.shm_fd = os.open(shm_path, os.O_RDONLY)
           self.shm_map = mmap.mmap(self.shm_fd, actual_size, mmap.MAP_SHARED, mmap.PROT_READ)
           print(f"Connected to shared memory with reduced size: {actual_size} bytes")
           return True
         else:
-          # Normal case - full size available
           self.shm_fd = os.open(shm_path, os.O_RDONLY)
           self.shm_map = mmap.mmap(self.shm_fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ)
           print(f"Connected to shared memory: {SHM_NAME} ({SHM_SIZE} bytes)")
@@ -229,28 +213,26 @@ class SharedMemoryReader:
       return False
 
   def read_frame(self):
-    """Read frame from shared memory"""
+    """Return the next new frame, or None."""
     if not self.shm_map:
       return None
 
     try:
-      # Read metadata - matching C++ packed SharedFrame struct
       self.shm_map.seek(0)
-      timestamp = struct.unpack('<Q', self.shm_map.read(8))[0]  # uint64_t (little-endian)
-      width = struct.unpack('<I', self.shm_map.read(4))[0]  # uint32_t
-      height = struct.unpack('<I', self.shm_map.read(4))[0]  # uint32_t
-      size = struct.unpack('<I', self.shm_map.read(4))[0]  # uint32_t
-      format_type = struct.unpack('<I', self.shm_map.read(4))[0]  # uint32_t
-      ready = struct.unpack('B', self.shm_map.read(1))[0]  # uint8_t
+      timestamp = struct.unpack('<Q', self.shm_map.read(8))[0]
+      width = struct.unpack('<I', self.shm_map.read(4))[0]
+      height = struct.unpack('<I', self.shm_map.read(4))[0]
+      size = struct.unpack('<I', self.shm_map.read(4))[0]
+      format_type = struct.unpack('<I', self.shm_map.read(4))[0]
+      ready = struct.unpack('B', self.shm_map.read(1))[0]
 
-      # Source (pre-scaling) size, then 2 bytes of padding. Zero from writers that predate scaling.
+      # Source (pre-scaling) size, 0 from older writers, then 2 bytes padding.
       source_width, source_height = struct.unpack('<HH', self.shm_map.read(4))
       self.shm_map.read(2)
 
       if ready == 0 or size == 0 or timestamp <= self.last_timestamp:
         return None
 
-      # Data starts right after padding (at offset 31)
       frame_data = self.shm_map.read(size)
 
       self.last_timestamp = timestamp
@@ -262,7 +244,7 @@ class SharedMemoryReader:
       return None
 
   def start_monitoring(self):
-    """Start monitoring shared memory for new frames"""
+    """Poll shared memory for new frames on a background thread."""
     self.running = True
 
     def monitor_loop():
@@ -270,7 +252,6 @@ class SharedMemoryReader:
       frame_count = 0
 
       while self.running:
-        # Try to connect if not connected
         if not self.shm_map:
           if self.connect():
             retry_count = 0
@@ -279,22 +260,18 @@ class SharedMemoryReader:
             time.sleep(2 if retry_count < 10 else 10)
             continue
 
-        # Read frame
         frame = self.read_frame()
         if frame:
           frame_count += 1
-          # Add to cache
           if frame_cache.add_frame(frame['timestamp'], frame['data'], frame['width'], frame['height'],
                                    frame['source_width'], frame['source_height']):
-            # Debug: Check if frame data is valid JPEG
             if frame_count % 10 == 0:
-              # Check JPEG header
               if frame['data'][:2] == b'\xff\xd8':
                 print(f"Frame {frame_count}: Valid JPEG, {frame['size']} bytes, {frame['width']}x{frame['height']}")
               else:
                 print(f"Frame {frame_count}: INVALID DATA! First bytes: {frame['data'][:10].hex() if frame['data'] else 'empty'}")
 
-        time.sleep(0.05)  # Check 20 times per second for low latency
+        time.sleep(0.05)
 
     thread = threading.Thread(target=monitor_loop, daemon=True)
     thread.start()
@@ -311,7 +288,6 @@ class SharedMemoryReader:
 
 shm_reader = SharedMemoryReader()
 
-# Enhanced HTML with improved WebSocket handling
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -380,7 +356,7 @@ def forward_input(event) -> bool:
 
 @app.route('/input', methods=['POST'])
 def handle_input():
-  """Handle input events from web client (fallback for when the WebSocket is down)"""
+  """Input fallback for when the WebSocket is down."""
   data = request.get_json(silent=True)
   if drive_state.engaged:
     return jsonify({'status': 'blocked', 'message': 'Remote input is disabled while engaged'}), 409
@@ -424,7 +400,7 @@ def handle_client_message(ws, client_id, data):
 
 @sock.route('/stream')
 def stream(ws):
-  """WebSocket endpoint for real-time frame streaming and input"""
+  """Frames out, input and feedback in."""
   client_id = id(ws)
   print(f"Client {client_id} connected")
 
@@ -441,14 +417,12 @@ def stream(ws):
     last_stats_sent = 0.0
     input_blocked = None
 
-    # Send current frame immediately if available
     latest = frame_cache.get_latest()
     if latest:
       ws.send(latest['packet'])
       last_sent_timestamp = latest['timestamp']
       print(f"Sent initial frame to client {client_id}")
 
-    # Main streaming loop
     while True:
       try:
         if drive_state.engaged != input_blocked:
@@ -467,8 +441,7 @@ def stream(ws):
         print(f"Error sending to client {client_id}: {e}")
         break
 
-      # Wait for client messages (input, feedback, frame requests) instead of sleeping, so
-      # input is forwarded as soon as it arrives. Then drain anything else already queued.
+      # Block on client messages instead of sleeping so input is forwarded immediately.
       data = ws.receive(timeout=0.02)
       while data:
         handle_client_message(ws, client_id, data)
@@ -491,17 +464,16 @@ def stream(ws):
 
 @app.route('/stats')
 def get_stats():
-  """Get memory and performance statistics"""
+  """Cache and client stats."""
   stats = frame_cache.get_stats()
   with clients_lock:
     stats['websocket_clients'] = len(websocket_clients)
   return jsonify(stats)
 
 
-# Alternative SSE endpoint for browsers that have WebSocket issues
 @app.route('/stream-sse')
 def stream_sse():
-  """Server-Sent Events endpoint as fallback"""
+  """Server-Sent Events fallback for browsers with WebSocket issues."""
 
   def generate():
     last_timestamp = 0
@@ -518,7 +490,6 @@ def stream_sse():
         }
         yield f"data: {json.dumps(data)}\n\n"
       else:
-        # Send heartbeat
         yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
       time.sleep(0.1)
 
@@ -526,7 +497,7 @@ def stream_sse():
 
 
 def wait_for_wifi(interface="wlan0", timeout=10, delay=2):
-  """Wait for network connection"""
+  """Wait briefly for a network route."""
   print("Waiting for network connection...")
   for _ in range(timeout // delay):
     try:
@@ -554,11 +525,9 @@ def main() -> None:
   print("✅ Automatic frame broadcasting")
   print("=" * 60)
 
-  # Start shared memory monitoring
   shm_reader.start_monitoring()
   drive_state.start()
 
-  # Run Flask with WebSocket support
   try:
     app.run(host='0.0.0.0', port=8081, debug=False)
   finally:

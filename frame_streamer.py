@@ -1,13 +1,6 @@
-"""Frame streamer for the raylib/pyray openpilot UI.
+"""Captures the raylib framebuffer and publishes JPEG frames to shared memory for stream_server.py.
 
-Python port of the old Qt ``frame_streamer.cc``. Instead of ``QPixmap::grab()``
-on a QWidget, this captures the current raylib framebuffer with
-``load_image_from_screen()`` and writes a JPEG-compressed frame plus metadata
-into POSIX shared memory. Only the GPU readback happens on the render thread;
-copying the pixels, resizing and JPEG encoding run on a worker thread (Pillow
-releases the GIL for those), so encoding doesn't add to UI frame time.
-``stream_server.py`` reads that shared memory and
-broadcasts frames to browsers over WebSocket.
+Only the GPU readback runs on the render thread; encoding happens on a worker thread.
 """
 
 import io
@@ -26,7 +19,7 @@ FRAME_DATA_SIZE = 4 * 1920 * 1080  # 8,294,400 bytes (max 1080p RGBA)
 METADATA_SIZE = 31
 SHM_SIZE = METADATA_SIZE + FRAME_DATA_SIZE
 
-# timestamp, width, height, size, format, ready, source width, source height (frame size before scaling)
+# timestamp, width, height, size, format, ready, source width, source height (pre-scaling)
 HEADER_FMT = "<QIIIIBHH2x"
 
 FORMAT_JPEG = 1
@@ -44,16 +37,13 @@ ADAPT_RECOVER_S = 2.0
 ADAPT_HIGH_PRESSURE = 1.1
 ADAPT_LOW_PRESSURE = 0.6
 JPEG_SIZE_BUDGET_AT_10_FPS = 220_000
-# Encode scales offered to browsers. Only 0.5 is offered below full: it's an exact 2x2 box
-# reduce, which with the smaller encode costs less than encoding full size. Any other
-# smooth resize (e.g. 0.75 bilinear or box) costs more CPU than the encode it saves.
+# 0.5 is an exact 2x2 reduce and cheaper than a full-size encode; other resizes cost more than they save.
 SCALE_STEPS = (0.5, 1.0)
-# The browser may upscale by up to this much rather than get the next larger step.
+# How far the browser may upscale before it gets the next larger step.
 MAX_BROWSER_UPSCALE = 1.33
-# Queueing delay browsers can see before the link counts as congested.
+# Browser queueing delay at which the link counts as congested.
 NETWORK_DELAY_BUDGET_MS = 250.0
-# While the screen is unchanged no new JPEG is encoded, but the previous one is re-announced
-# this often so browsers keep seeing frames (FPS, latency) and the stream doesn't look stalled.
+# How often an unchanged frame is re-announced so the stream doesn't look stalled.
 UNCHANGED_KEEPALIVE_S = 1.0
 
 
@@ -69,19 +59,18 @@ class FrameStreamer:
     self.encode_pressure_ewma = 0.0
     self.last_adapt_time = 0.0
     self.scale = 1.0
-    # Last published frame, to skip re-encoding when the screen hasn't changed (worker thread only).
+    # Last published frame, used to skip unchanged frames (worker thread only).
     self._last_rgba = None
     self._last_encode_key = None
     self._last_header = None  # header fields after the timestamp
     self._last_publish_mono = 0.0
     self.frames_encoded = 0
     self.frames_unchanged = 0
-    # Adaptive rate/quality state is written by both the render thread (connect/disconnect) and the worker.
+    # Rate/quality state is shared by the render and worker threads.
     self._state_lock = threading.Lock()
     self._init_shm()
 
-    # One-slot handoff to the encoder: the render thread only captures when the worker is idle,
-    # so frames are skipped rather than queued and the readback cost isn't paid for nothing.
+    # One-slot handoff: frames are captured only when the encoder is idle, so they're skipped rather than queued.
     self._pending = None
     self._pending_cv = threading.Condition()
     self._encoding = False
@@ -154,7 +143,7 @@ class FrameStreamer:
       self.last_adapt_time = now_mono
 
   def _init_shm(self):
-    # Match the C++ behavior: unlink any stale segment, then (re)create.
+    # Unlink any stale segment, then recreate.
     try:
       stale = shm.SharedMemory(name=SHM_NAME)
       stale.close()
@@ -176,11 +165,7 @@ class FrameStreamer:
       self.shm = None
 
   def stream_frame(self):
-    """Capture the current raylib framebuffer and hand it to the encoder thread.
-
-    Must be called from the render thread while a frame is on screen
-    (i.e. before end_drawing swaps the buffers).
-    """
+    """Capture the framebuffer for the encoder. Call on the render thread before end_drawing."""
     if self.shm is None:
       return
 
@@ -190,17 +175,15 @@ class FrameStreamer:
       return
     with self._pending_cv:
       if self._encoding or self._pending is not None:
-        return  # encoder still busy with the previous frame; try again next frame
+        return  # encoder busy, try next frame
     self.last_capture_time = now_mono
 
-    # Ensure all queued draw commands are flushed before reading pixels.
-    # This keeps remote captures complete while still sampling before end_drawing().
+    # Flush queued draw commands so the capture is complete.
     flush_batch = getattr(pr, "rl_draw_render_batch_active", None)
     if callable(flush_batch):
       flush_batch()
 
-    # GL readback has to happen here, on the thread that owns the context. The image's
-    # pixel buffer is then owned by the encoder, which copies it and frees it.
+    # Readback must happen on the GL thread; the encoder takes ownership of the image and frees it.
     rl_image = pr.load_image_from_screen()
     capture_ms = int(time.clock_gettime(time.CLOCK_REALTIME) * 1000)
     with self._pending_cv:
@@ -237,12 +220,10 @@ class FrameStreamer:
       if data_size <= 0:
         return
 
-      # Copy raw RGBA bytes out of raylib's buffer so it can be freed below.
+      # Copy out of raylib's buffer so it can be freed below.
       rgba = bytes(pr.ffi.buffer(rl_image.data, data_size))
 
-      # Static screens repeat the same pixels for seconds at a time, so not every frame needs to be re-encoded.
-      # Compare bytes to avoid re-encoding the same frame, which is expensive and wastes bandwidth.
-      # Exit and scan the whole frame at the first byte difference.
+      # Static screens repeat for seconds at a time; a byte compare is far cheaper than re-encoding.
       scale = self._pick_scale(width)
       encode_key = (width, height, scale, self.jpeg_quality)
       if rgba == self._last_rgba and encode_key == self._last_encode_key:
@@ -257,7 +238,7 @@ class FrameStreamer:
       pil_img = Image.frombuffer("RGBA", (width, height), rgba, "raw", "RGBA", 0, 1)
 
       pil_img = pil_img.convert("RGB")  # JPEG has no alpha channel
-      # Reducing after the conversion is faster than before it (3 channels instead of 4).
+      # Reduce after converting: 3 channels instead of 4.
       self.scale = scale
       if self.scale != 1.0:
         pil_img = pil_img.reduce(round(1 / self.scale))
@@ -276,8 +257,7 @@ class FrameStreamer:
       if shm_buf is None:
         return
 
-      # Write payload first, then the header with ready=1 last, so the
-      # reader never sees ready=1 pointing at stale/partial data.
+      # Payload first, header last, so the reader never sees ready=1 over partial data.
       shm_buf[METADATA_SIZE : METADATA_SIZE + len(jpeg)] = jpeg
       self._last_header = (
         pil_img.width,
@@ -288,7 +268,7 @@ class FrameStreamer:
         width,
         height,
       )
-      # epoch timestamp (ms) of the capture, not the encode
+      # capture time (epoch ms), not encode time
       shm_buf[0:METADATA_SIZE] = struct.pack(HEADER_FMT, capture_ms, *self._last_header)
       self._last_publish_mono = capture_mono
       self.frames_encoded += 1
@@ -297,11 +277,11 @@ class FrameStreamer:
     except Exception as e:
       print(f"FrameStreamer error: {e}")
     finally:
-      # Free the raylib image memory to avoid leaking a frame per tick (UnloadImage is a plain free()).
+      # Free the raylib image so a frame isn't leaked per tick.
       pr.unload_image(rl_image)
 
   def _republish_last(self, capture_ms, capture_mono):
-    """Re-announce the JPEG already in shm under a new timestamp. Only the header is rewritten."""
+    """Re-announce the JPEG already in shm with a new timestamp."""
     shm_buf = self.shm.buf if self.shm is not None else None
     if shm_buf is None or self._last_header is None:
       return
@@ -309,7 +289,7 @@ class FrameStreamer:
     self._last_publish_mono = capture_mono
 
   def close(self):
-    # Stop the encoder before unmapping shm so it can't write into a closed segment.
+    # Stop the encoder before unmapping shm.
     with self._pending_cv:
       self._running = False
       job, self._pending = self._pending, None

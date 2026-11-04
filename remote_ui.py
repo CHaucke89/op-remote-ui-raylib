@@ -1,15 +1,9 @@
-"""Remote UI bootstrap for the raylib/pyray openpilot UI.
-
-Starts a ``TouchInjector`` and a ``FrameStreamer``. ``remote_ui_auto.py``
-splices this into openpilot's render loop by wrapping ``pyray.end_drawing``;
-you can also drive it from your own loop (see the README).
-"""
+"""Starts the TouchInjector and FrameStreamer for the openpilot UI."""
 
 import os
 import sys
 
-# Flat imports: this directory (and its ./vendor deps) is put on sys.path
-# by remote_ui_auto.py, or implicitly when running this file directly.
+# Flat imports from this directory and ./vendor.
 _here = os.path.dirname(os.path.abspath(__file__))
 for _p in (_here, os.path.join(_here, "vendor")):
   if os.path.isdir(_p) and _p not in sys.path:
@@ -23,11 +17,11 @@ _ui_state = None
 
 
 def _engaged() -> bool:
-  """True while openpilot is engaged. Remote taps are ignored then; local touch keeps working."""
+  """Remote input is ignored while engaged."""
   global _ui_state
   if _ui_state is None:
     try:
-      # Imported lazily: the UI has already created this singleton, and the smoke test runs without openpilot.
+      # Lazy, so the smoke test runs without openpilot.
       from openpilot.selfdrive.ui.ui_state import ui_state
       _ui_state = ui_state
     except Exception:
@@ -59,8 +53,7 @@ class RemoteUI:
 
 
 if __name__ == "__main__":
-  # Standalone smoke test: open a window, draw a moving box, stream it, and
-  # report remote clicks. Run stream_server.py separately and open the page.
+  # Smoke test: run stream_server.py separately and open the page.
   import pyray as pr
 
   injector = TouchInjector()

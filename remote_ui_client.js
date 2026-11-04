@@ -21,22 +21,20 @@ let renderFps = 0;
 let lastRenderFpsUpdate = Date.now();
 let frameWidth = canvas.width;
 let frameHeight = canvas.height;
-// The UI's real resolution. Frames may arrive downscaled, but input is always in these coordinates.
+// UI resolution. Frames may be downscaled, but input uses these coordinates.
 let deviceWidth = canvas.width;
 let deviceHeight = canvas.height;
 let inputBlocked = false;
 
-// Binary frame message: type(1) + timestamp ms(8) + width(4) + height(4) + source width(2) +
-// source height(2), then JPEG bytes
+// Binary frame header (type, timestamp, width, height, source width/height), then JPEG.
 const FRAME_MSG_TYPE = 1;
 const FRAME_HEADER_SIZE = 21;
 
-// Only one frame is decoded at a time; anything arriving meanwhile replaces the pending frame.
+// One decode at a time; newer frames replace the pending one.
 let decoding = false;
 let pendingFrame = null;
 
-// Queueing delay = latency above the lowest latency seen recently. Device and browser clocks
-// differ by a constant offset, which cancels out, so this is a skew-free congestion signal.
+// Queueing delay is latency above the recent minimum, which cancels out clock skew.
 const LATENCY_BASELINE_WINDOW_MS = 10000;
 const latencySamples = [];
 let queueDelay = 0;
@@ -50,7 +48,6 @@ function updateQueueDelay(now, sampleLatency) {
   queueDelay = Math.max(0, sampleLatency - baseline);
 }
 
-// FPS calculation
 function updateStats() {
   const now = Date.now();
   const elapsed = now - lastFpsTime;
@@ -247,7 +244,6 @@ function connectWebSocket() {
     lastSentViewWidth = null;  // a new connection starts with no request on the server
     sendView();
 
-    // Request initial frame
     ws.send(JSON.stringify({ type: 'request_frame' }));
   };
 
@@ -278,7 +274,6 @@ function connectWebSocket() {
     statusText.textContent = 'Disconnected - Reconnecting...';
     debug.textContent = `Disconnected: ${event.reason || 'Connection lost'}`;
 
-    // Reconnect after 2 seconds
     if (!reconnectTimer) {
       reconnectTimer = setTimeout(connectWebSocket, 2000);
     }
@@ -290,18 +285,16 @@ function connectWebSocket() {
   };
 }
 
-// Check for stale frames
+// Ask for a frame if none arrived recently.
 setInterval(() => {
   if (isConnected && Date.now() - lastFrameTime > 5000) {
     debug.textContent = 'No frames received for 5 seconds';
-    // Request a frame
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'request_frame' }));
     }
   }
 }, 5000);
 
-// Touch/click handling
 function getDeviceCoordinates(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = deviceWidth / rect.width;
@@ -317,7 +310,7 @@ function sendInput(eventData) {
     return;
   }
 
-  // Prefer the WebSocket: one persistent, ordered connection. Fall back to HTTP while reconnecting.
+  // Prefer the ordered WebSocket; fall back to HTTP while reconnecting.
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'input', event: eventData }));
     return;
@@ -346,7 +339,6 @@ let dragStartX = 0;
 let dragStartY = 0;
 const dragThreshold = 8;
 
-// Mouse events
 canvas.addEventListener('mousedown', (e) => {
   const coords = getDeviceCoordinates(e.clientX, e.clientY);
   mouseDown = true;
@@ -392,8 +384,7 @@ canvas.addEventListener('mouseleave', (e) => {
   dragActive = false;
 });
 
-// mousedown/mouseup already deliver the full press -> release, so click only shows the
-// indicator. Sending a 'click' here as well would make the UI see a second tap.
+// mousedown/mouseup already send the press; a 'click' here would double-tap.
 canvas.addEventListener('click', (e) => {
   if (dragActive) {
     dragActive = false;
@@ -409,7 +400,6 @@ canvas.addEventListener('wheel', (e) => {
   sendInput({ type: 'scroll', x: coords.x, y: coords.y, deltaY: e.deltaY });
 }, { passive: false });
 
-// Touch events
 canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
   if (e.touches.length === 1) {
@@ -450,8 +440,7 @@ canvas.addEventListener('touchcancel', (e) => {
   }
 }, { passive: false });
 
-// Keyboard input: desktop keys and pastes are forwarded. Phones use openpilot's own
-// on-screen keyboard by tapping it in the stream.
+// Desktop keys and pastes are forwarded; phones use openpilot's on-screen keyboard.
 const heldKeys = new Set();
 const NAMED_KEYS = new Set([
   'Enter', 'Escape', 'Backspace', 'Tab', 'Delete', 'ArrowLeft', 'ArrowRight', 'ArrowUp',
@@ -501,10 +490,7 @@ document.addEventListener('paste', (e) => {
   }
 });
 
-// Resolution. Every browser shares one encode, so the device uses the widest width any
-// connected client asks for, and sends half resolution when that is small enough. Auto asks
-// for the canvas's on-screen size, counting at most 1.5 device pixels per CSS pixel: past
-// that, phones' 3x screens add bytes but little legibility.
+// Resolution: Auto requests the canvas size at up to 1.5x DPR; past that, 3x phone screens add bytes, not legibility.
 const resToggle = document.getElementById('res-toggle');
 const RES_MODES = [
   { id: 'auto', label: 'Auto' },
@@ -519,7 +505,7 @@ let viewTimer = null;
 try {
   resMode = RES_MODES.find(m => m.id === localStorage.getItem('remoteUiRes')) || resMode;
 } catch (e) {
-  // storage unavailable (private mode); keep the default
+  // storage unavailable, keep the default
 }
 
 function requestedViewWidth() {
@@ -552,7 +538,7 @@ resToggle.addEventListener('click', () => {
   try {
     localStorage.setItem('remoteUiRes', resMode.id);
   } catch (e) {
-    // not persisted; still applies to this session
+    // not persisted
   }
   sendView();
 });
@@ -563,12 +549,10 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', scheduleSendView);
 }
 
-// Start WebSocket connection
 layoutCanvas();
 sendView();
 connectWebSocket();
 
-// Update stats periodically
 setInterval(updateStats, 100);
 setInterval(() => sendFeedback(false), 500);
 

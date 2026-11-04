@@ -1,14 +1,7 @@
-"""Remote UI client connection state shared between stream_server and the UI.
+"""Browser client state (count, network delay, requested width) shared from stream_server to the UI.
 
-Replaces the ``RemoteUIClientConnected`` param. Param writes go through a
-tmp file + fsync + rename, which is far too heavy to do from the streaming
-path. Instead, ``stream_server`` owns a tiny POSIX shared memory segment at
-``/dev/shm/openpilot_ui_clients`` holding the current WebSocket client count,
-the worst network queueing delay reported by those clients and the widest
-frame any of them asked for, and the UI maps it read-only. Reads are a plain memory access, no syscalls.
-
-The writer never unlinks the segment: a reader's mmap is bound to the inode,
-so recreating the file would leave readers looking at a stale copy forever.
+A tiny shm segment the UI can read every frame without syscalls. The writer never unlinks it,
+since readers' mmaps are bound to the inode.
 """
 
 import mmap
@@ -16,12 +9,12 @@ import os
 import struct
 
 SHM_PATH = "/dev/shm/openpilot_ui_clients"
-STATE_FMT = "<III"  # uint32 client count, uint32 worst client queue delay (ms), uint32 requested frame width (0 = full)
+STATE_FMT = "<III"  # client count, worst queue delay (ms), requested width (0 = full)
 STATE_SIZE = struct.calcsize(STATE_FMT)
 
 
 class ClientStateWriter:
-  """Owned by stream_server. Publishes the number of connected browsers and their network delay."""
+  """Owned by stream_server."""
 
   def __init__(self):
     fd = os.open(SHM_PATH, os.O_RDWR | os.O_CREAT, 0o644)
@@ -71,7 +64,7 @@ class ClientStateReader:
       os.close(fd)
 
   def connected(self) -> bool:
-    # Retry until stream_server creates the segment; one failed open() per call is negligible.
+    # Retry until stream_server creates the segment.
     if self._map is None and not self._open():
       return False
     assert self._map is not None

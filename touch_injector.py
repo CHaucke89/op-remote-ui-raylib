@@ -1,19 +1,7 @@
-"""Touch/mouse/keyboard injector for the raylib/pyray openpilot UI.
+"""Injects remote touch, mouse and keyboard input into the raylib/pyray UI.
 
-Python port of the old Qt ``touch_injector.cc``. The Qt version received JSON
-input events on a Unix socket and synthesized ``QMouseEvent``/``QWheelEvent``
-objects. raylib has no event queue to post into: input is *polled* every frame
-(``is_mouse_button_pressed`` etc.). So instead we monkeypatch pyray's input
-functions to report remote state, falling back to the real functions when no
-remote client is active.
-
-Clients may either send a single JSON object per connection (legacy) or keep
-a connection open and stream newline-delimited JSON objects.
-
-Keyboard events (``keydown``/``keyup``/``keytap`` with a browser ``KeyboardEvent.key``
-name, and ``text`` for typed or pasted strings) are queued and handed to the UI
-one frame at a time by ``end_frame()``, which the render loop calls once per frame,
-mirroring how raylib fills its key and char queues in ``PollInputEvents``.
+raylib polls input instead of queueing events, so pyray's input functions are monkeypatched
+to report remote state, falling back to local input when no remote client is active.
 """
 
 import json
@@ -28,18 +16,16 @@ import pyray as pr
 
 SOCKET_PATH = "/tmp/ui_touch_socket"
 
-# How long a synthetic "click"/"tap" is held down before releasing, so the UI
-# sees a full press -> release cycle across polled frames.
+# How long a synthetic tap is held, so the UI sees a full press/release across frames.
 CLICK_HOLD_S = 0.12
 # Fall back to local input if no remote event arrives within this window.
 REMOTE_TIMEOUT_S = 1.0
 
 MOUSE_BUTTON_LEFT = 0
 
-# Release remote-held keys if the browser goes quiet (e.g. the tab lost focus mid-press).
-# Held keys are kept alive by the browser's auto-repeat keydowns.
+# Release held keys if the browser goes quiet; auto-repeat keydowns keep them alive.
 KEY_HOLD_TIMEOUT_S = 1.0
-# Most characters a single frame will accept, so a large paste can't stall the UI.
+# Per-frame character cap so a large paste can't stall the UI.
 MAX_PENDING_CHARS = 512
 
 # Browser KeyboardEvent.key -> raylib key name (KEY_<name>)
@@ -74,8 +60,7 @@ def browser_key_to_raylib(key) -> int:
 
 class TouchInjector:
   def __init__(self, input_blocked=None):
-    # Optional callable; while it returns True remote input is dropped and
-    # local touch stays in control (e.g. while engaged).
+    # While this returns True, remote input is dropped (e.g. while engaged).
     self._input_blocked = input_blocked or (lambda: False)
     self.running = False
     self.thread = None
@@ -102,7 +87,7 @@ class TouchInjector:
     self._frame_released: set[int] = set()
     self._frame_char_queue: deque[int] = deque()
 
-    # Keep references to the genuine pyray functions for local fallback.
+    # Originals, for local fallback.
     self._orig_get_touch_position = pr.get_touch_position
     self._orig_get_mouse_position = pr.get_mouse_position
     self._orig_is_mouse_button_down = pr.is_mouse_button_down
@@ -149,7 +134,7 @@ class TouchInjector:
     clients: dict[socket.socket, bytearray] = {}
     try:
       while self.running:
-        # 1s timeout so we can notice self.running going False.
+        # Timeout so stop() is noticed.
         ready, _, _ = select.select([self.server, *clients], [], [], 1.0)
         for s in ready:
           if s is self.server:
@@ -177,7 +162,7 @@ class TouchInjector:
               if line.strip():
                 self._process_message(bytes(line))
           else:
-            # EOF: a legacy one-shot client sends a single object without a newline.
+            # EOF: one-shot clients send a single object without a newline.
             if buf.strip():
               self._process_message(bytes(buf))
             del clients[s]
@@ -201,7 +186,7 @@ class TouchInjector:
       return
 
     if msg_type in ("keydown", "keyup", "keytap", "text"):
-      # Keyboard events leave the pointer alone, so they don't take over local touch.
+      # Keyboard events don't take over the pointer.
       with self._lock:
         self._process_key_message(msg_type, msg, now)
       return
@@ -213,18 +198,15 @@ class TouchInjector:
         self._y = int(msg["y"])
 
       if msg_type in ("click", "tap", "touch"):
-        # Instantaneous tap: press now, auto-release shortly after.
         self._begin_press(now, hold=True)
       elif msg_type in ("mousedown", "touchstart"):
         self._begin_press(now, hold=False)
       elif msg_type in ("mousemove", "touchmove", "drag"):
-        # Position already updated above; keep button state as-is.
         pass
       elif msg_type in ("mouseup", "touchend", "dragend"):
         self._release()
       elif msg_type == "scroll":
-        # Positive deltaY scrolls down in the browser; raylib's wheel
-        # move is positive up, so invert.
+        # Browser deltaY is positive down, raylib's wheel is positive up.
         self._wheel += -float(msg.get("deltaY", 0)) / 100.0
 
   def _process_key_message(self, msg_type, msg, now):
@@ -239,7 +221,7 @@ class TouchInjector:
     code = browser_key_to_raylib(key)
     if msg_type in ("keydown", "keytap"):
       if msg.get("repeat"):
-        # Auto-repeat just keeps the key held; the UI does its own repeat via is_key_down.
+        # The UI does its own key repeat via is_key_down.
         return
       if isinstance(key, str) and len(key) == 1:
         self._queue_chars(key)
@@ -261,7 +243,7 @@ class TouchInjector:
         self._pending_releases |= self._held_keys
 
       pressed = self._pending_presses
-      # A key pressed and released within one frame stays down for that frame, released on the next.
+      # A key pressed and released in one frame is released on the next.
       released = self._pending_releases - set(pressed)
       self._pending_presses = []
       self._pending_releases -= released
@@ -291,7 +273,7 @@ class TouchInjector:
       self._release()
 
   def refresh_blocked(self):
-    """Called once per frame so a press in progress is dropped as soon as the gate closes."""
+    """Call once per frame so a held press is dropped as soon as input is blocked."""
     self._is_blocked()
 
   def _is_blocked(self):
@@ -305,7 +287,6 @@ class TouchInjector:
     return blocked
 
   def _drop_remote_state(self):
-    # Hand control straight back to local input and forget any held press.
     self._last_msg_time = 0.0
     self._down = False
     self._down_until = None
@@ -382,8 +363,7 @@ class TouchInjector:
         return delta
     return self._orig_get_mouse_wheel_move()
 
-  # Keyboard hooks: remote keys are merged with local ones (the device has no keyboard,
-  # but a PC running the UI does).
+  # Remote keys are merged with local ones (a PC running the UI has a keyboard).
 
   def _hook_get_key_pressed(self):
     with self._lock:
