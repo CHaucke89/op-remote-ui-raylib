@@ -100,7 +100,7 @@ struct SharedFrame {
 On the device (or any machine with an openpilot checkout):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui/main/install.sh | bash
+curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui-raylib/main/install.sh | bash
 ```
 
 Or from a clone: `./install.sh [OPENPILOT_DIR]` (default `/data/openpilot`).
