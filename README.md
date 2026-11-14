@@ -11,11 +11,11 @@ Current primary path is Python + raylib/pyray:
 - UI integration helper: `remote_ui.py`
 - Browser server: `stream_server.py`
 
-The C++/Qt files are still in this repository as a legacy implementation reference:
+The C++/Qt files are kept in `legacy/` as an implementation reference:
 
-- `frame_streamer.cc/.h`
-- `touch_injector.cc/.h`
-- `main.cc`
+- `legacy/frame_streamer.cc/.h`
+- `legacy/touch_injector.cc/.h`
+- `legacy/main.cc`
 
 ## What This Repository Provides
 
@@ -46,6 +46,9 @@ The browser page can be installed as a PWA ("Add to Home Screen"), which runs it
     - Monkeypatches pyray polled input functions (mouse, touch, wheel and keyboard) to expose remote state, falling back to local input.
     - Keyboard events and pasted text are queued and released one frame at a time.
 
+- `remote_ui_protocol.py`
+    - Shared IPC layout: shared memory name and header format, and the touch socket path.
+
 - `client_state.py`
     - Tiny shared memory segment the server writes and the UI maps read-only: client count, worst network delay and requested frame width.
 
@@ -67,7 +70,7 @@ The browser page can be installed as a PWA ("Add to Home Screen"), which runs it
 
 ### C++/Qt (legacy)
 
-The C++ files implement the same shared-memory + socket concepts for the older Qt UI. They are useful as protocol references, but are not the primary integration path for current raylib/pyray UI.
+The C++ files in `legacy/` implement the same shared-memory + socket concepts for the older Qt UI. They are useful as protocol references, but are not the primary integration path for current raylib/pyray UI.
 
 ## Shared Memory Contract
 
@@ -97,7 +100,7 @@ struct SharedFrame {
 On the device (or any machine with an openpilot checkout):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui/main/install.sh | bash
+curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui-raylib/main/install.sh | bash
 ```
 
 Or from a clone: `./install.sh [OPENPILOT_DIR]` (default `/data/openpilot`).
@@ -159,7 +162,7 @@ Examples:
 ```
 
 ```json
-{"type":"keytap","key":"Enter"}
+{"type":"keydown","key":"Enter"}
 ```
 
 ```json
@@ -196,4 +199,4 @@ Run it directly from this directory (`python3 remote_ui.py`); imports are flat, 
 ## Notes
 
 - This repository focuses on streaming and input plumbing, not full openpilot deployment orchestration.
-- `main.cc` and the Qt classes document the older integration style and protocol history.
+- `legacy/main.cc` and the Qt classes document the older integration style and protocol history.

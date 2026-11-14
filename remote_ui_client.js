@@ -21,20 +21,18 @@ let renderFps = 0;
 let lastRenderFpsUpdate = Date.now();
 let frameWidth = canvas.width;
 let frameHeight = canvas.height;
-// UI resolution. Frames may be downscaled, but input uses these coordinates.
 let deviceWidth = canvas.width;
 let deviceHeight = canvas.height;
 let inputBlocked = false;
 
-// Binary frame header (type, timestamp, width, height, source width/height), then JPEG.
+// Binary frame message: type(1) + timestamp ms(8) + width(4) + height(4) + source width(2) +
+// source height(2), then JPEG bytes
 const FRAME_MSG_TYPE = 1;
 const FRAME_HEADER_SIZE = 21;
 
-// One decode at a time; newer frames replace the pending one.
 let decoding = false;
 let pendingFrame = null;
 
-// Queueing delay is latency above the recent minimum, which cancels out clock skew.
 const LATENCY_BASELINE_WINDOW_MS = 10000;
 const latencySamples = [];
 let queueDelay = 0;
@@ -119,12 +117,12 @@ function sendFeedback(force = false) {
   }));
 }
 
-function drawFrame(source, width, height) {
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-    frameWidth = width;
-    frameHeight = height;
+function drawFrame(source) {
+  if (canvas.width !== source.width || canvas.height !== source.height) {
+    canvas.width = source.width;
+    canvas.height = source.height;
+    frameWidth = source.width;
+    frameHeight = source.height;
     layoutCanvas();
   }
 
@@ -141,7 +139,7 @@ function drawFrame(source, width, height) {
 function decodeFrame(blob) {
   if (window.createImageBitmap) {
     return createImageBitmap(blob).then(bitmap => {
-      drawFrame(bitmap, bitmap.width, bitmap.height);
+      drawFrame(bitmap);
       bitmap.close();
     });
   }
@@ -150,7 +148,7 @@ function decodeFrame(blob) {
     const url = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => {
-      drawFrame(img, img.width, img.height);
+      drawFrame(img);
       URL.revokeObjectURL(url);
       resolve();
     };
@@ -193,8 +191,8 @@ function handleBinaryMessage(buffer) {
   const timestamp = Number(view.getBigUint64(1, true));
   const width = view.getUint32(9, true);
   const height = view.getUint32(13, true);
-  const sourceWidth = view.getUint16(17, true) || width;
-  const sourceHeight = view.getUint16(19, true) || height;
+  const sourceWidth = view.getUint16(17, true);
+  const sourceHeight = view.getUint16(19, true);
   if (sourceWidth !== deviceWidth || sourceHeight !== deviceHeight) {
     deviceWidth = sourceWidth;
     deviceHeight = sourceHeight;
@@ -241,7 +239,7 @@ function connectWebSocket() {
       reconnectTimer = null;
     }
 
-    lastSentViewWidth = null;  // a new connection starts with no request on the server
+    lastSentViewWidth = null;
     sendView();
 
     ws.send(JSON.stringify({ type: 'request_frame' }));
@@ -285,7 +283,6 @@ function connectWebSocket() {
   };
 }
 
-// Ask for a frame if none arrived recently.
 setInterval(() => {
   if (isConnected && Date.now() - lastFrameTime > 5000) {
     debug.textContent = 'No frames received for 5 seconds';
@@ -310,7 +307,7 @@ function sendInput(eventData) {
     return;
   }
 
-  // Prefer the ordered WebSocket; fall back to HTTP while reconnecting.
+  // Prefer the WebSocket: one persistent, ordered connection. Fall back to HTTP while reconnecting.
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'input', event: eventData }));
     return;
@@ -384,7 +381,6 @@ canvas.addEventListener('mouseleave', (e) => {
   dragActive = false;
 });
 
-// mousedown/mouseup already send the press; a 'click' here would double-tap.
 canvas.addEventListener('click', (e) => {
   if (dragActive) {
     dragActive = false;
@@ -440,7 +436,8 @@ canvas.addEventListener('touchcancel', (e) => {
   }
 }, { passive: false });
 
-// Desktop keys and pastes are forwarded; phones use openpilot's on-screen keyboard.
+// Keyboard input: desktop keys and pastes are forwarded. Phones use openpilot's own
+// on-screen keyboard by tapping it in the stream.
 const heldKeys = new Set();
 const NAMED_KEYS = new Set([
   'Enter', 'Escape', 'Backspace', 'Tab', 'Delete', 'ArrowLeft', 'ArrowRight', 'ArrowUp',
@@ -449,10 +446,9 @@ const NAMED_KEYS = new Set([
 
 function isForwardableKey(e) {
   if (e.ctrlKey || e.metaKey || e.altKey) {
-    return false;  // leave browser shortcuts (copy, paste, reload...) alone
+    return false;
   }
-  return e.key && e.key !== 'Unidentified' && e.key !== 'Process' && e.key !== 'Dead' &&
-    (e.key.length === 1 || NAMED_KEYS.has(e.key));
+  return !!e.key && (e.key.length === 1 || NAMED_KEYS.has(e.key));
 }
 
 function releaseHeldKeys() {
@@ -490,7 +486,6 @@ document.addEventListener('paste', (e) => {
   }
 });
 
-// Resolution: Auto requests the canvas size at up to 1.5x DPR; past that, 3x phone screens add bytes, not legibility.
 const resToggle = document.getElementById('res-toggle');
 const RES_MODES = [
   { id: 'auto', label: 'Auto' },
@@ -505,7 +500,7 @@ let viewTimer = null;
 try {
   resMode = RES_MODES.find(m => m.id === localStorage.getItem('remoteUiRes')) || resMode;
 } catch (e) {
-  // storage unavailable, keep the default
+  // storage unavailable (e.g. private mode); keep the default
 }
 
 function requestedViewWidth() {
@@ -517,7 +512,6 @@ function requestedViewWidth() {
 }
 
 function sendView() {
-  resToggle.textContent = `Res: ${resMode.label}`;
   const width = requestedViewWidth();
   if (!ws || ws.readyState !== WebSocket.OPEN || !width) {
     return;
@@ -535,10 +529,11 @@ function scheduleSendView() {
 
 resToggle.addEventListener('click', () => {
   resMode = RES_MODES[(RES_MODES.indexOf(resMode) + 1) % RES_MODES.length];
+  resToggle.textContent = `Res: ${resMode.label}`;
   try {
     localStorage.setItem('remoteUiRes', resMode.id);
   } catch (e) {
-    // not persisted
+    // storage unavailable; the choice still applies to this session
   }
   sendView();
 });
@@ -549,6 +544,7 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', scheduleSendView);
 }
 
+resToggle.textContent = `Res: ${resMode.label}`;
 layoutCanvas();
 sendView();
 connectWebSocket();

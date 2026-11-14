@@ -2,7 +2,7 @@
 # Install op-remote-ui into an openpilot checkout (stock or fork). Idempotent.
 #
 #   ./install.sh [OPENPILOT_DIR]
-#   curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui/main/install.sh | bash
+#   curl -sL https://raw.githubusercontent.com/CHaucke89/op-remote-ui-raylib/main/install.sh | bash
 #
 # Env: INSTALL_DIR (default /data/op-remote-ui), OPENPILOT_DIR (default /data/openpilot),
 #      REPO_TARBALL (override download URL when not run from a checkout).
@@ -10,8 +10,8 @@ set -euo pipefail
 
 OP_DIR="${1:-${OPENPILOT_DIR:-/data/openpilot}}"
 INSTALL_DIR="${INSTALL_DIR:-/data/op-remote-ui}"
-REPO_TARBALL="${REPO_TARBALL:-https://github.com/CHaucke89/op-remote-ui/archive/refs/heads/main.tar.gz}"
-FILES=(remote_ui.py remote_ui_auto.py touch_injector.py frame_streamer.py client_state.py stream_server.py
+REPO_TARBALL="${REPO_TARBALL:-https://github.com/CHaucke89/op-remote-ui-raylib/archive/refs/heads/main.tar.gz}"
+FILES=(remote_ui.py remote_ui_auto.py touch_injector.py frame_streamer.py client_state.py remote_ui_protocol.py stream_server.py
        remote_ui_client.js remote_ui.css remote_ui.webmanifest requirements.txt)
 BEGIN="# >>> op-remote-ui >>>"
 END="# <<< op-remote-ui <<<"
