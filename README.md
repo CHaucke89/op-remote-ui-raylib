@@ -11,11 +11,11 @@ Current primary path is Python + raylib/pyray:
 - UI integration helper: `remote_ui.py`
 - Browser server: `stream_server.py`
 
-The C++/Qt files are still in this repository as a legacy implementation reference:
+The C++/Qt files are kept in `legacy/` as an implementation reference:
 
-- `frame_streamer.cc/.h`
-- `touch_injector.cc/.h`
-- `main.cc`
+- `legacy/frame_streamer.cc/.h`
+- `legacy/touch_injector.cc/.h`
+- `legacy/main.cc`
 
 ## What This Repository Provides
 
@@ -70,7 +70,7 @@ The browser page can be installed as a PWA ("Add to Home Screen"), which runs it
 
 ### C++/Qt (legacy)
 
-The C++ files implement the same shared-memory + socket concepts for the older Qt UI. They are useful as protocol references, but are not the primary integration path for current raylib/pyray UI.
+The C++ files in `legacy/` implement the same shared-memory + socket concepts for the older Qt UI. They are useful as protocol references, but are not the primary integration path for current raylib/pyray UI.
 
 ## Shared Memory Contract
 
@@ -199,4 +199,4 @@ Run it directly from this directory (`python3 remote_ui.py`); imports are flat, 
 ## Notes
 
 - This repository focuses on streaming and input plumbing, not full openpilot deployment orchestration.
-- `main.cc` and the Qt classes document the older integration style and protocol history.
+- `legacy/main.cc` and the Qt classes document the older integration style and protocol history.
