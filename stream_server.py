@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Streams UI frames from shared memory to browsers over WebSocket and forwards their input to the UI."""
-
 import os
 import time
 import json
@@ -13,7 +11,7 @@ import base64
 import sys
 from collections import deque
 
-# Flat imports from this directory and ./vendor.
+# Flat imports from this directory and ./vendor (installed by install.sh).
 HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (HERE, os.path.join(HERE, "vendor")):
   if os.path.isdir(_p) and _p not in sys.path:
@@ -21,41 +19,37 @@ for _p in (HERE, os.path.join(HERE, "vendor")):
 
 from flask import Flask, render_template_string, request, jsonify, Response, send_from_directory  # noqa: E402
 from flask_sock import Sock  # noqa: E402
+from werkzeug.serving import make_server  # noqa: E402
 from client_state import ClientStateWriter  # noqa: E402
+from protocol import FORMAT_JPEG, HEADER_FMT, METADATA_SIZE, SHM_NAME, SHM_SIZE, TOUCH_SOCKET_PATH
 
 app = Flask(__name__)
 sock = Sock(app)
 
-SHM_NAME = "/openpilot_ui_frames"
-# Packed 31-byte header (see frame_streamer.HEADER_FMT), then JPEG data.
-FRAME_DATA_SIZE = 4 * 1920 * 1080
-METADATA_SIZE = 31
-SHM_SIZE = METADATA_SIZE + FRAME_DATA_SIZE
-
-TOUCH_SOCKET_PATH = '/tmp/ui_touch_socket'
-
-# Binary frame message header, then JPEG. Source size is the UI resolution input coordinates use.
 FRAME_MSG_TYPE = 1
 FRAME_HEADER_FMT = '<BQIIHH'
+FRAME_HEADER_SIZE = struct.calcsize(FRAME_HEADER_FMT)
 
-# Client delay reports expire after this long.
+HTTP_PORT = 8081
+BIND_RETRY_S = 5.0
+
 FEEDBACK_STALE_S = 3.0
 
 websocket_clients = set()
 clients_lock = threading.Lock()
 client_state: ClientStateWriter | None = None
-client_feedback: dict[int, tuple[float, float]] = {}  # client id -> (monotonic time, queue delay ms)
-client_view_widths: dict[int, int] = {}  # client id -> frame width the browser wants
+client_feedback: dict[int, tuple[float, float]] = {}
+client_view_widths: dict[int, int] = {}
 
 
 def publish_requested_width():
-  """All clients share one encode, so the widest request wins. Caller holds clients_lock."""
+  """One encode is shared by every client, so the widest request wins. Caller holds clients_lock."""
   if client_state is not None:
     client_state.set_requested_width(max(client_view_widths.values(), default=0))
 
 
 def publish_network_delay():
-  """Publish the worst recent client delay. Caller holds clients_lock."""
+  """Publish the worst fresh client queue delay so the UI can back off. Caller holds clients_lock."""
   now = time.monotonic()
   for cid in [cid for cid, (t, _) in client_feedback.items() if now - t > FEEDBACK_STALE_S]:
     del client_feedback[cid]
@@ -64,8 +58,6 @@ def publish_network_delay():
 
 
 class InputForwarder:
-  """Persistent newline-delimited JSON connection to the UI's touch injector."""
-
   def __init__(self, path=TOUCH_SOCKET_PATH):
     self.path = path
     self.sock = None
@@ -87,7 +79,7 @@ class InputForwarder:
   def send(self, event: dict):
     payload = (json.dumps({**event, 'timestamp': time.monotonic()}) + '\n').encode()
     with self.lock:
-      # Retry once in case the UI restarted.
+      # Retry once with a fresh connection in case the UI restarted.
       for attempt in range(2):
         try:
           if self.sock is None:
@@ -105,7 +97,7 @@ input_forwarder = InputForwarder()
 
 
 class DriveState:
-  """Tracks engagement so remote input can be refused while driving."""
+  """Tracks whether openpilot is engaged so remote input can be refused while driving."""
 
   def __init__(self):
     self.engaged = False
@@ -117,7 +109,6 @@ class DriveState:
       except ImportError:
         import cereal.messaging as messaging
     except ImportError as e:
-      # The UI applies the same gate; only the browser banner is lost.
       print(f"DriveState: cereal unavailable, not gating input here: {e}")
       return
 
@@ -148,13 +139,13 @@ class FrameCache:
     self.latest_timestamp = 0
     self.latest_frame = None
 
-  def add_frame(self, timestamp: int, data: bytes, width: int, height: int, source_width: int = 0, source_height: int = 0):
+  def add_frame(self, timestamp: int, data: bytes, width: int, height: int, source_width: int, source_height: int):
     with self.lock:
       if timestamp > self.latest_timestamp:
-        # Pack once, not per client.
         packet = struct.pack(FRAME_HEADER_FMT, FRAME_MSG_TYPE, timestamp, width, height,
                              source_width or width, source_height or height) + data
-        frame_info = {'timestamp': timestamp, 'data': data, 'packet': packet, 'size': len(data), 'width': width, 'height': height}
+        frame_info = {'timestamp': timestamp, 'data': memoryview(packet)[FRAME_HEADER_SIZE:], 'packet': packet,
+                      'size': len(data), 'width': width, 'height': height}
         self.frames.append(frame_info)
         self.latest_timestamp = timestamp
         self.latest_frame = frame_info
@@ -182,9 +173,8 @@ class SharedMemoryReader:
     self.last_timestamp = 0
 
   def connect(self):
-    """Connect to shared memory created by the UI's FrameStreamer"""
     try:
-      shm_path = f"/dev/shm{SHM_NAME}"
+      shm_path = f"/dev/shm/{SHM_NAME}"
 
       if os.path.exists(shm_path):
         stat_info = os.stat(shm_path)
@@ -213,38 +203,26 @@ class SharedMemoryReader:
       return False
 
   def read_frame(self):
-    """Return the next new frame, or None."""
     if not self.shm_map:
       return None
 
     try:
-      self.shm_map.seek(0)
-      timestamp = struct.unpack('<Q', self.shm_map.read(8))[0]
-      width = struct.unpack('<I', self.shm_map.read(4))[0]
-      height = struct.unpack('<I', self.shm_map.read(4))[0]
-      size = struct.unpack('<I', self.shm_map.read(4))[0]
-      format_type = struct.unpack('<I', self.shm_map.read(4))[0]
-      ready = struct.unpack('B', self.shm_map.read(1))[0]
-
-      # Source (pre-scaling) size, 0 from older writers, then 2 bytes padding.
-      source_width, source_height = struct.unpack('<HH', self.shm_map.read(4))
-      self.shm_map.read(2)
+      timestamp, width, height, size, format_type, ready, source_width, source_height = struct.unpack_from(HEADER_FMT, self.shm_map, 0)
 
       if ready == 0 or size == 0 or timestamp <= self.last_timestamp:
         return None
 
-      frame_data = self.shm_map.read(size)
+      frame_data = self.shm_map[METADATA_SIZE : METADATA_SIZE + size]
 
       self.last_timestamp = timestamp
 
       return {'timestamp': timestamp, 'width': width, 'height': height, 'source_width': source_width, 'source_height': source_height,
-              'size': size, 'format': 'jpeg' if format_type == 1 else 'raw', 'data': frame_data}
+              'size': size, 'format': 'jpeg' if format_type == FORMAT_JPEG else 'raw', 'data': frame_data}
     except Exception as e:
       print(f"Error reading frame: {e}")
       return None
 
   def start_monitoring(self):
-    """Poll shared memory for new frames on a background thread."""
     self.running = True
 
     def monitor_loop():
@@ -271,14 +249,13 @@ class SharedMemoryReader:
               else:
                 print(f"Frame {frame_count}: INVALID DATA! First bytes: {frame['data'][:10].hex() if frame['data'] else 'empty'}")
 
-        time.sleep(0.05)
+        time.sleep(0.05)  # twice the streamer's max frame rate
 
     thread = threading.Thread(target=monitor_loop, daemon=True)
     thread.start()
     print("Frame monitoring started")
 
   def close(self):
-    """Clean up shared memory connection"""
     self.running = False
     if self.shm_map:
       self.shm_map.close()
@@ -343,7 +320,7 @@ def remote_ui_manifest():
 
 
 def forward_input(event) -> bool:
-  """Forward one input event to the UI. Returns False if it was dropped."""
+  """Returns False if the event was dropped."""
   if not isinstance(event, dict) or drive_state.engaged:
     return False
   try:
@@ -356,7 +333,7 @@ def forward_input(event) -> bool:
 
 @app.route('/input', methods=['POST'])
 def handle_input():
-  """Input fallback for when the WebSocket is down."""
+  """Fallback for when the WebSocket is down."""
   data = request.get_json(silent=True)
   if drive_state.engaged:
     return jsonify({'status': 'blocked', 'message': 'Remote input is disabled while engaged'}), 409
@@ -400,7 +377,6 @@ def handle_client_message(ws, client_id, data):
 
 @sock.route('/stream')
 def stream(ws):
-  """Frames out, input and feedback in."""
   client_id = id(ws)
   print(f"Client {client_id} connected")
 
@@ -441,7 +417,8 @@ def stream(ws):
         print(f"Error sending to client {client_id}: {e}")
         break
 
-      # Block on client messages instead of sleeping so input is forwarded immediately.
+      # Wait for client messages (input, feedback, frame requests) instead of sleeping, so
+      # input is forwarded as soon as it arrives. Then drain anything else already queued.
       data = ws.receive(timeout=0.02)
       while data:
         handle_client_message(ws, client_id, data)
@@ -464,17 +441,15 @@ def stream(ws):
 
 @app.route('/stats')
 def get_stats():
-  """Cache and client stats."""
   stats = frame_cache.get_stats()
   with clients_lock:
     stats['websocket_clients'] = len(websocket_clients)
   return jsonify(stats)
 
 
+# Fallback for browsers that can't use WebSockets
 @app.route('/stream-sse')
 def stream_sse():
-  """Server-Sent Events fallback for browsers with WebSocket issues."""
-
   def generate():
     last_timestamp = 0
     while True:
@@ -497,7 +472,6 @@ def stream_sse():
 
 
 def wait_for_wifi(interface="wlan0", timeout=10, delay=2):
-  """Wait briefly for a network route."""
   print("Waiting for network connection...")
   for _ in range(timeout // delay):
     try:
@@ -512,28 +486,47 @@ def wait_for_wifi(interface="wlan0", timeout=10, delay=2):
   return False
 
 
+def port_holder(port: int) -> str:
+  """Name and pid of whatever is listening on a TCP port, for the log."""
+  try:
+    out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True, timeout=5).stdout
+    return out.split("users:", 1)[1].strip()
+  except (OSError, subprocess.SubprocessError, IndexError):
+    return "unknown"
+
+
+def serve(port: int = HTTP_PORT, retry_s: float = BIND_RETRY_S) -> None:
+  # Manager doesn't restart a process that exits, so wait for a busy port instead of dying
+  while True:
+    try:
+      server = make_server('0.0.0.0', port, app, threaded=True)
+      break
+    except SystemExit:
+      print(f"remote_ui: port {port} is held by {port_holder(port)}, retrying in {retry_s:.0f}s")
+      time.sleep(retry_s)
+  print(f"remote_ui: serving on port {port}")
+  server.serve_forever()
+
+
 def main() -> None:
   global client_state
   client_state = ClientStateWriter()
   wait_for_wifi()
 
-  print("=" * 60)
-  print("openpilot Remote UI Streaming Server")
-  print("=" * 60)
-  print("✅ Zero disk storage - Memory only")
-  print("✅ WebSocket real-time streaming")
-  print("✅ Automatic frame broadcasting")
-  print("=" * 60)
+  print("_-=-_" * 12)
+  print("_-=-_" * 12)
+  print("openpilot Remote UI Streamer")
+  print("_-=-_" * 12)
+  print("_-=-_" * 12)
 
   shm_reader.start_monitoring()
   drive_state.start()
 
   try:
-    app.run(host='0.0.0.0', port=8081, debug=False)
+    serve()
   finally:
     client_state.close()
     shm_reader.close()
-
 
 if __name__ == "__main__":
   main()

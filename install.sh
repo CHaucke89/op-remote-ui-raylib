@@ -11,7 +11,7 @@ set -euo pipefail
 OP_DIR="${1:-${OPENPILOT_DIR:-/data/openpilot}}"
 INSTALL_DIR="${INSTALL_DIR:-/data/op-remote-ui}"
 REPO_TARBALL="${REPO_TARBALL:-https://github.com/CHaucke89/op-remote-ui/archive/refs/heads/main.tar.gz}"
-FILES=(remote_ui.py remote_ui_auto.py touch_injector.py frame_streamer.py client_state.py stream_server.py
+FILES=(remote_ui.py remote_ui_auto.py touch_injector.py frame_streamer.py client_state.py protocol.py stream_server.py
        remote_ui_client.js remote_ui.css remote_ui.webmanifest requirements.txt)
 BEGIN="# >>> op-remote-ui >>>"
 END="# <<< op-remote-ui <<<"

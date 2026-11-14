@@ -33,20 +33,32 @@ def _engaged() -> bool:
 
 class RemoteUI:
   def __init__(self):
+    # Remote taps are ignored while engaged; local touch keeps working.
     self.injector = TouchInjector(input_blocked=_engaged)
     self.injector.start()
+    # Prefer the UI's per-frame tick, which runs before widgets read input. Older UIs don't have one,
+    # so update() is called from the end_drawing hook instead.
+    self._gui_app = None
+    try:
+      from openpilot.system.ui.lib.application import gui_app
+      gui_app.add_nav_stack_tick(self.injector.end_frame)
+      self._gui_app = gui_app
+    except Exception:
+      pass
     self.streamer = FrameStreamer()
     print("RemoteUI: streaming + input injection started")
 
   def update(self):
     """Call once per rendered frame, whether or not a browser is connected."""
-    self.injector.refresh_blocked()
-    self.injector.end_frame()
+    if self._gui_app is None:
+      self.injector.end_frame()
 
   def stream_frame(self):
     self.streamer.stream_frame()
 
   def close(self):
+    if self._gui_app is not None:
+      self._gui_app.remove_nav_stack_tick(self.injector.end_frame)
     self.streamer.close()
     self.injector.stop()
     print("RemoteUI: stopped")
