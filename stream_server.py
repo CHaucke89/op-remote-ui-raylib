@@ -21,7 +21,7 @@ from flask import Flask, render_template_string, request, jsonify, Response, sen
 from flask_sock import Sock  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
 from client_state import ClientStateWriter  # noqa: E402
-from protocol import FORMAT_JPEG, HEADER_FMT, METADATA_SIZE, SHM_NAME, SHM_SIZE, TOUCH_SOCKET_PATH
+from remote_ui_protocol import FORMAT_JPEG, HEADER_FMT, METADATA_SIZE, SHM_NAME, SHM_SIZE, TOUCH_SOCKET_PATH
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -514,9 +514,7 @@ def main() -> None:
   wait_for_wifi()
 
   print("_-=-_" * 12)
-  print("_-=-_" * 12)
   print("openpilot Remote UI Streamer")
-  print("_-=-_" * 12)
   print("_-=-_" * 12)
 
   shm_reader.start_monitoring()
@@ -527,6 +525,7 @@ def main() -> None:
   finally:
     client_state.close()
     shm_reader.close()
+
 
 if __name__ == "__main__":
   main()

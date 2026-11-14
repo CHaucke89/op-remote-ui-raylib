@@ -500,6 +500,7 @@ let viewTimer = null;
 try {
   resMode = RES_MODES.find(m => m.id === localStorage.getItem('remoteUiRes')) || resMode;
 } catch (e) {
+  // storage unavailable (e.g. private mode); keep the default
 }
 
 function requestedViewWidth() {
@@ -532,6 +533,7 @@ resToggle.addEventListener('click', () => {
   try {
     localStorage.setItem('remoteUiRes', resMode.id);
   } catch (e) {
+    // storage unavailable; the choice still applies to this session
   }
   sendView();
 });

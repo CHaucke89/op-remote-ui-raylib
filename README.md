@@ -46,7 +46,7 @@ The browser page can be installed as a PWA ("Add to Home Screen"), which runs it
     - Monkeypatches pyray polled input functions (mouse, touch, wheel and keyboard) to expose remote state, falling back to local input.
     - Keyboard events and pasted text are queued and released one frame at a time.
 
-- `protocol.py`
+- `remote_ui_protocol.py`
     - Shared IPC layout: shared memory name and header format, and the touch socket path.
 
 - `client_state.py`

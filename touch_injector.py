@@ -10,7 +10,7 @@ from collections import deque
 
 import pyray as pr
 
-from protocol import TOUCH_SOCKET_PATH as SOCKET_PATH
+from remote_ui_protocol import TOUCH_SOCKET_PATH
 
 # How long a synthetic "click"/"tap" is held down before releasing, so the UI
 # sees a full press -> release cycle across polled frames.
@@ -45,6 +45,10 @@ BROWSER_KEY_NAMES = {
 }
 
 
+POINTER_TYPES = {"click", "tap", "touch", "mousedown", "touchstart", "mousemove", "touchmove", "drag",
+                 "mouseup", "touchend", "dragend", "scroll"}
+
+
 def browser_key_to_raylib(key) -> int:
   """Map a browser KeyboardEvent.key to a raylib key code, 0 if unmapped."""
   if not isinstance(key, str):
@@ -61,6 +65,7 @@ class TouchInjector:
     # local touch stays in control (e.g. while engaged).
     self._input_blocked = input_blocked or (lambda: False)
     self._blocked = False
+    self._gate_error_logged = False
     self.running = False
     self.thread = None
     self._lock = threading.Lock()
@@ -84,13 +89,13 @@ class TouchInjector:
     self._apply_hooks()
 
   def _setup_socket(self):
-    if os.path.exists(SOCKET_PATH):
-      os.remove(SOCKET_PATH)
+    if os.path.exists(TOUCH_SOCKET_PATH):
+      os.remove(TOUCH_SOCKET_PATH)
     self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    self.server.bind(SOCKET_PATH)
+    self.server.bind(TOUCH_SOCKET_PATH)
     self.server.listen(5)
     self.server.setblocking(False)
-    print(f"TouchInjector: listening on {SOCKET_PATH}")
+    print(f"TouchInjector: listening on {TOUCH_SOCKET_PATH}")
 
   def start(self):
     self.running = True
@@ -104,8 +109,8 @@ class TouchInjector:
     try:
       self.server.close()
     finally:
-      if os.path.exists(SOCKET_PATH):
-        os.remove(SOCKET_PATH)
+      if os.path.exists(TOUCH_SOCKET_PATH):
+        os.remove(TOUCH_SOCKET_PATH)
 
   def _accept_loop(self):
     clients: dict[socket.socket, bytearray] = {}
@@ -169,6 +174,8 @@ class TouchInjector:
         # Keyboard events leave the pointer alone, so they don't take over local touch.
         self._process_key_message(msg_type, msg, now)
         return
+      if msg_type not in POINTER_TYPES:
+        return  # unknown (e.g. "keytap" from an older client); don't let it take over local touch
 
       self._last_msg_time = now
       if "x" in msg and "y" in msg:
@@ -254,10 +261,14 @@ class TouchInjector:
       self._release()
 
   def _check_blocked(self):
+    # Fail closed: if the engaged check breaks, refuse remote input rather than risk it while driving.
     try:
       return bool(self._input_blocked())
-    except Exception:
-      return False
+    except Exception as e:
+      if not self._gate_error_logged:
+        print(f"TouchInjector: input gate failed, blocking remote input: {e}")
+        self._gate_error_logged = True
+      return True
 
   def _set_blocked(self, blocked):
     """Caller holds the lock. Remote state is dropped once, when the gate closes."""

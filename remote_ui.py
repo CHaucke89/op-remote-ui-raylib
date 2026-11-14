@@ -43,8 +43,8 @@ class RemoteUI:
       from openpilot.system.ui.lib.application import gui_app
       gui_app.add_nav_stack_tick(self.injector.end_frame)
       self._gui_app = gui_app
-    except Exception:
-      pass
+    except (ImportError, AttributeError) as e:
+      print(f"RemoteUI: no nav-stack tick ({e}), publishing input from end_drawing")
     self.streamer = FrameStreamer()
     print("RemoteUI: streaming + input injection started")
 
@@ -57,10 +57,12 @@ class RemoteUI:
     self.streamer.stream_frame()
 
   def close(self):
-    if self._gui_app is not None:
-      self._gui_app.remove_nav_stack_tick(self.injector.end_frame)
-    self.streamer.close()
-    self.injector.stop()
+    try:
+      if self._gui_app is not None:
+        self._gui_app.remove_nav_stack_tick(self.injector.end_frame)
+    finally:
+      self.streamer.close()
+      self.injector.stop()
     print("RemoteUI: stopped")
 
 

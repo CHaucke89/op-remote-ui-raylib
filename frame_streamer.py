@@ -8,7 +8,7 @@ from PIL import Image
 import pyray as pr
 
 from client_state import ClientStateReader
-from protocol import FORMAT_JPEG, FRAME_DATA_SIZE, HEADER_FMT, METADATA_SIZE, SHM_NAME, SHM_SIZE
+from remote_ui_protocol import FORMAT_JPEG, FRAME_DATA_SIZE, HEADER_FMT, METADATA_SIZE, SHM_NAME, SHM_SIZE
 
 JPEG_QUALITY = 85
 FRAME_RATE_LIMIT = 10
