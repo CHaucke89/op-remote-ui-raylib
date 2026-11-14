@@ -198,5 +198,7 @@ Run it directly from this directory (`python3 remote_ui.py`); imports are flat, 
 
 ## Notes
 
-- This repository focuses on streaming and input plumbing, not full openpilot deployment orchestration.
+- This repository was initially meant to be a straight port of the Qt-based streamer to Python,
+  but has evolved into an ongoing project that has now been fully integrated into my openpilot/sunnypilot
+  fork, [cloudypilot](https://github.com/CHaucke89/cloudypilot.git), requiring no installation after-the-fact.
 - `legacy/main.cc` and the Qt classes document the older integration style and protocol history.
